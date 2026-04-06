@@ -5,6 +5,13 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
+
+if (process.platform !== "darwin") {
+  console.warn(
+    "[prepare-app-bundle] Chromium se descargó para esta máquina (no macOS). " +
+      "Para un .app usable en Mac, ejecuta `npm run prepare:mac-bundle` en macOS antes de `npm run pack:mac`.",
+  );
+}
 const releaseRoot = path.join(root, "release");
 const bundleDir = path.join(releaseRoot, "app-bundle");
 const browsersDir = path.join(releaseRoot, "pw-browsers");
