@@ -2,21 +2,27 @@
   "name": "automate-sunat",
   "version": "1.0.0",
   "description": "Seller-to-SUNAT browser automation with a live dashboard.",
-  "main": "dist/index.js",
+  "main": "electron-dist/main.js",
   "scripts": {
     "dev": "concurrently -k -n server,web -c blue,magenta \"npm run dev:server\" \"npm run dev:web:wait\"",
     "dev:server": "tsx watch src/index.ts",
+    "dev:electron": "npm run build:electron && concurrently -k -n server,electron -c blue,green \"npm run dev:server\" \"node tools/wait-for-server.mjs && ELECTRON_SKIP_BACKEND=1 npx electron .\"",
     "dev:web": "npm --prefix frontend run dev",
     "dev:web:wait": "node tools/wait-for-server.mjs && npm --prefix frontend run dev",
     "start": "npm run build:web && tsx src/index.ts",
+    "build": "tsc && npm run build:web && npm run build:electron",
     "build:web": "npm --prefix frontend run build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "prepare:mac-bundle": "node scripts/prepare-app-bundle.mjs",
+    "pack:mac": "npm run build && npm run prepare:mac-bundle && electron-builder --mac",
     "test": "npm run test:server && npm run test:web",
     "test:server": "vitest run tests",
     "test:web": "npm --prefix frontend run test",
     "test:watch": "vitest",
-    "typecheck": "npm run typecheck:server && npm run typecheck:web",
+    "typecheck": "npm run typecheck:server && npm run typecheck:web && npm run typecheck:electron",
     "typecheck:server": "tsc --noEmit",
     "typecheck:web": "npm --prefix frontend run typecheck",
+    "typecheck:electron": "tsc -p tsconfig.electron.json --noEmit",
     "pw:install": "playwright install chromium",
     "reset:data": "rm -f data/automation.db data/automation.db-shm data/automation.db-wal && rm -rf data/screenshots data/traces data/auth"
   },
@@ -39,9 +45,39 @@
     "@types/node": "^25.5.0",
     "@types/supertest": "^7.2.0",
     "concurrently": "^9.2.1",
+    "electron": "^35.1.5",
+    "electron-builder": "^26.0.12",
     "supertest": "^7.2.2",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.1"
+  },
+  "build": {
+    "appId": "com.automatesunat.panel",
+    "productName": "Automate SUNAT",
+    "files": [
+      "electron-dist/**/*.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "release/app-bundle",
+        "to": "app-bundle",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "release/pw-browsers",
+        "to": "pw-browsers",
+        "filter": ["**/*"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.business",
+      "target": ["dmg", "zip"],
+      "arch": ["x64", "arm64"]
+    },
+    "directories": {
+      "output": "release/electron-out"
+    }
   }
 }
