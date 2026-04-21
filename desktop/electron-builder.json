@@ -7,7 +7,18 @@
   "files": [
     "dist/**"
   ],
-  "extraResources": [],
+  "extraResources": [
+    {
+      "from": "release/app-bundle",
+      "to": "app-bundle",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "release/pw-browsers",
+      "to": "pw-browsers",
+      "filter": ["**/*"]
+    }
+  ],
   "asar": true,
   "linux": {
     "icon": "assets/icons",
