@@ -20,6 +20,11 @@ import {
   WorkflowStepStatus,
 } from "./domain";
 import { RunStore } from "./store";
+import {
+  appendTimingMark,
+  getStep2TimingsPath,
+  wrapTimingReporter,
+} from "./timing-tracker";
 
 /** Prefijo en mensajes de `onStep` que se guardan como nivel `debug` (traza del vigilante de modales SUNAT). */
 const SUNAT_MODAL_TRACE_LOG_PREFIX = "[sunat-modal-trace] ";
@@ -469,23 +474,34 @@ export class AutomationCoordinator {
     this.ensureRunOutputJson(runId, sales);
     const boletasDownloadDir = this.ensureBoletasDownloadDir();
 
+    const timingsFile = getStep2TimingsPath(this.config.dataPaths.rootDir);
+
     for (const sale of sales) {
       const draft = saleToInvoiceDraft(sale);
       const attemptId = this.store.createAttempt(sale.externalId, draft, runId);
       this.store.setSaleStatus(sale.externalId, "drafted", attemptId);
 
+      const timingContext = { runId, attemptId, saleExternalId: sale.externalId };
+      appendTimingMark(timingsFile, timingContext, "sale_start");
+      const timedStep = wrapTimingReporter(this.stepReporter(sale.externalId), {
+        outFile: timingsFile,
+        context: timingContext,
+      });
+
       let submission: PreparedSubmission | undefined;
 
       try {
+        appendTimingMark(timingsFile, timingContext, "prepare_submission_start");
         submission = await this.invoiceEmitter.prepareSubmission(
           attemptId,
           draft,
-          this.stepReporter(sale.externalId),
+          timedStep,
           {
             runId,
             boletasDownloadDir,
           },
         );
+        appendTimingMark(timingsFile, timingContext, "prepare_submission_end");
       } catch (error) {
         if (error instanceof OperatorCancelledError) {
           cancelled += 1;
@@ -537,10 +553,12 @@ export class AutomationCoordinator {
       );
 
       try {
+        appendTimingMark(timingsFile, timingContext, "submit_start");
         const result = await this.submitPreparedSubmissionAutomatically(
           submission,
-          this.stepReporter(sale.externalId),
+          timedStep,
         );
+        appendTimingMark(timingsFile, timingContext, "submit_end");
         submitted += 1;
         this.store.markAttemptSubmitted(
           attemptId,
@@ -594,6 +612,7 @@ export class AutomationCoordinator {
 
       this.syncRegistrationSummary(submitted, failed, cancelled);
       this.publish();
+      appendTimingMark(timingsFile, timingContext, "sale_end");
     }
 
     this.syncRegistrationSummary(submitted, failed, cancelled);
