@@ -11,6 +11,7 @@ import {
   extractSunatReceiptPrefix,
   falabellaDocumentsTextLooksEmpty,
   formatSunatCurrency,
+  normalizeFalabellaCustomerDocumentNumber,
   splitIgv,
 } from "../src/browser";
 
@@ -93,6 +94,12 @@ describe("browser helpers", () => {
     expect(falabellaDocumentsTextLooksEmpty("No data")).toBe(true);
     expect(falabellaDocumentsTextLooksEmpty("3229988096")).toBe(false);
     expect(falabellaDocumentsTextLooksEmpty("Documento pendiente 1 de 2")).toBe(false);
+  });
+
+  test("keeps the Falabella customer document digits exactly as shown, including leading zeros", () => {
+    expect(normalizeFalabellaCustomerDocumentNumber("00126096")).toBe("00126096");
+    expect(normalizeFalabellaCustomerDocumentNumber(" 00 126 096 ")).toBe("00126096");
+    expect(normalizeFalabellaCustomerDocumentNumber("N° 00126096")).toBe("00126096");
   });
 
   test("uses the exact SUNAT ids for the final emit flow in the active profiles", () => {

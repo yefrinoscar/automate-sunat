@@ -66,7 +66,46 @@ export class OperatorCancelledError extends AutomationError {
   }
 }
 
+export class OmitSaleError extends AutomationError {
+  constructor(message: string, artifacts: Artifact[] = []) {
+    super(message, artifacts);
+    this.name = "OmitSaleError";
+  }
+}
+
 type PageScope = Page | Frame;
+type SunatValidationWatcherController = {
+  pause(reason?: string): void;
+  resume(): void;
+  stop(): void;
+  isPaused(): boolean;
+};
+
+const SUNAT_TIMING = {
+  validationIframePollMs: 750,
+  validationIframePostFoundPauseMs: 250,
+  loginPostRucTabPauseMs: 150,
+  loginPostSubmitNetworkIdleTimeoutMs: 5_000,
+  menuClickPauseMs: 200,
+  notificationsDismissPauseMs: 250,
+  processingMarkerAppearTimeoutMs: 1_200,
+  processingMarkerAppearPollMs: 150,
+  processingPollMs: 250,
+  processingProgressLogMs: 4_000,
+  postDocumentFillProcessingTimeoutMs: 6_000,
+  postCustomerContinueProcessingTimeoutMs: 8_000,
+  postTransportAcceptProcessingTimeoutMs: 8_000,
+  itemDialogPollMs: 150,
+  itemGridPollMs: 150,
+  itemAmountPreviewPollMs: 150,
+  inconsistentIdentityRetryPauseMs: 300,
+  inconsistentIdentitySecondRetryPauseMs: 250,
+  postInconsistentIdentityRecoveryPauseMs: 250,
+  postWithoutDocumentSelectionPauseMs: 200,
+  currencyTypingDelayMs: 25,
+} as const;
+
+const SUNAT_REQUIRES_HEADFUL = true;
 
 export function isFalabellaDocumentsUrl(url: string): boolean {
   return /sellercenter\.falabella\.com\/order\/invoice/i.test(url);
@@ -336,11 +375,9 @@ export class ConfigurableSellerSource implements SellerSource {
 
   private async newContext(browser: Browser, authFileName: string): Promise<BrowserContext> {
     const authPath = this.authFile(authFileName);
-
     if (fs.existsSync(authPath)) {
       return browser.newContext({ storageState: authPath });
     }
-
     return browser.newContext();
   }
 
@@ -436,18 +473,21 @@ export class ConfigurableSellerSource implements SellerSource {
 }
 
 export class FalabellaSellerSource implements SellerSource {
-  constructor(private readonly config: AppConfig) {}
+  constructor(
+    private readonly config: AppConfig,
+    private readonly accountId?: string,
+  ) {}
 
   async fetchSales(onStep: StepReporter, options?: FetchSalesOptions): Promise<Sale[]> {
     await onStep("Abriendo Falabella Seller Center");
 
     const browser = await launchBrowser(this.config);
-    const context = await newFalabellaContext(browser);
+    const context = await newFalabellaContext(browser, this.authFilePath());
     const page = await context.newPage();
 
     try {
       await loginToFalabella(page, this.config.sellerCredentials, onStep, this.config.sellerPurchasedOrdersUrl);
-      await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
+      await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, this.config, onStep);
       const searchFromIso = options?.falabellaDocumentsSearchFromIso;
       const searchToIso = options?.falabellaDocumentsSearchToIso;
       const candidates = await collectFalabellaPendingRowsAcrossPages(page, onStep, searchFromIso, searchToIso);
@@ -458,7 +498,13 @@ export class FalabellaSellerSource implements SellerSource {
         const detailPage = await context.newPage();
 
         try {
-          const detailMap = await waitForFalabellaOrderDetailReady(detailPage, candidate.detailUrl);
+          const detailMap = await waitForFalabellaOrderDetailReady(
+            detailPage,
+            candidate.detailUrl,
+            this.config,
+            candidate.externalId,
+            onStep,
+          );
 
           if (falabellaDetailIndicatesFactura(detailMap)) {
             await onStep(
@@ -469,12 +515,20 @@ export class FalabellaSellerSource implements SellerSource {
 
           const sale = await readFalabellaSaleFromDetail(detailPage, candidate, this.config, {
             initialDetailMap: detailMap,
+            onStep,
           });
           sales.push(sale);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error ?? "Error desconocido.");
+          const compactMessage = message.split("\n")[0] ?? message;
+          await onStep(
+            `Orden ${candidate.externalId}: falló al abrir o leer el detalle en Falabella; la omito y sigo con la siguiente. ${compactMessage}`,
+          );
         } finally {
           await detailPage.close().catch(() => undefined);
         }
       }
+      await context.storageState({ path: this.authFilePath() });
       return sales;
     } finally {
       await context.close().catch(() => undefined);
@@ -486,12 +540,12 @@ export class FalabellaSellerSource implements SellerSource {
     await onStep(`Refrescando la orden ${externalId} en Falabella`);
 
     const browser = await launchBrowser(this.config);
-    const context = await newFalabellaContext(browser);
+    const context = await newFalabellaContext(browser, this.authFilePath());
     const page = await context.newPage();
 
     try {
       await loginToFalabella(page, this.config.sellerCredentials, onStep, this.config.sellerPurchasedOrdersUrl);
-      await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, onStep);
+      await openFalabellaDocumentsPage(page, this.config.sellerPurchasedOrdersUrl, this.config, onStep);
       const candidate = await findFalabellaPendingRowByOrderIdAcrossPages(
         page,
         externalId,
@@ -505,7 +559,13 @@ export class FalabellaSellerSource implements SellerSource {
 
       const detailPage = await context.newPage();
       try {
-        const detailMap = await waitForFalabellaOrderDetailReady(detailPage, candidate.detailUrl);
+        const detailMap = await waitForFalabellaOrderDetailReady(
+          detailPage,
+          candidate.detailUrl,
+          this.config,
+          candidate.externalId,
+          onStep,
+        );
 
         if (falabellaDetailIndicatesFactura(detailMap)) {
           await onStep(
@@ -514,9 +574,12 @@ export class FalabellaSellerSource implements SellerSource {
           return undefined;
         }
 
-        return await readFalabellaSaleFromDetail(detailPage, candidate, this.config, {
+        const sale = await readFalabellaSaleFromDetail(detailPage, candidate, this.config, {
           initialDetailMap: detailMap,
+          onStep,
         });
+        await context.storageState({ path: this.authFilePath() });
+        return sale;
       } finally {
         await detailPage.close().catch(() => undefined);
       }
@@ -539,7 +602,7 @@ export class FalabellaSellerSource implements SellerSource {
 
     await onStep(`Capturando evidencia en Falabella para ${sale.externalId}`);
     const browser = await launchBrowser(this.config);
-    const context = await newFalabellaContext(browser);
+    const context = await newFalabellaContext(browser, this.authFilePath());
     const page = await context.newPage();
 
     try {
@@ -554,11 +617,19 @@ export class FalabellaSellerSource implements SellerSource {
         `${attemptId}-seller-detail.png`,
       );
       await page.screenshot({ path: screenshotPath, fullPage: true });
+      await context.storageState({ path: this.authFilePath() });
       return [{ kind: "screenshot", path: screenshotPath }];
     } finally {
       await context.close().catch(() => undefined);
       await browser.close().catch(() => undefined);
     }
+  }
+
+  private authFilePath(): string {
+    return path.join(
+      this.config.dataPaths.authDir,
+      accountScopedAuthFileName(this.accountId, "seller.json"),
+    );
   }
 }
 
@@ -635,7 +706,12 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         );
         if (documentTypeField) {
           await onStep("Selector del tipo de documento encontrado; ajustando opción.");
-          await ensureCustomerDocumentType(documentTypeField.locator, draft.customer.documentNumber);
+          await ensureCustomerDocumentType(
+            page,
+            documentTypeField.locator,
+            draft.customer.documentNumber,
+            onStep,
+          );
         } else {
           await onStep("No apareció un selector editable de tipo de documento; continúo con el flujo.");
         }
@@ -648,8 +724,13 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         15_000,
       );
       await onStep(`Campo documento encontrado (${await describeLocatorIdentity(customerDocumentField.locator)}).`);
-      await customerDocumentField.locator.fill(draft.customer.documentNumber);
+      const writtenDocument = await fillSunatCustomerDocumentFieldExact(
+        page,
+        customerDocumentField.locator,
+        draft.customer.documentNumber,
+      );
       await customerDocumentField.locator.press("Tab").catch(() => undefined);
+      await onStep(`Documento ingresado en SUNAT exactamente como quedó en el campo: ${writtenDocument || "(vacío)"}.`);
       await onStep("Documento ingresado; espero que SUNAT complete el nombre del cliente.");
 
       await onStep(`Validando nombre del cliente en SUNAT para ${draft.saleExternalId}`);
@@ -711,7 +792,9 @@ export class SunatPortalEmitter implements InvoiceEmitter {
           customerNameField.scope,
           draft,
           this.profile,
+          this.config,
           onStep,
+          validationWatcher,
         );
       } else {
         await ensureRowCount(
@@ -736,7 +819,11 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       }
 
       await continueSunatBoletaWizard(page, this.profile, onStep);
-      await page.screenshot({ path: preSubmitScreenshot, fullPage: true });
+      const preSubmitArtifacts: Artifact[] = [];
+      if (this.config.debugArtifacts) {
+        await page.screenshot({ path: preSubmitScreenshot, fullPage: true });
+        preSubmitArtifacts.push({ kind: "screenshot", path: preSubmitScreenshot });
+      }
 
       return new PendingSunatSubmission({
         attemptId,
@@ -746,14 +833,23 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         page,
         tracePath,
         profile: this.profile,
-        preSubmitArtifacts: [{ kind: "screenshot", path: preSubmitScreenshot }],
+        preSubmitArtifacts,
         config: this.config,
+        sunatAuthFilePath: path.join(
+          this.config.dataPaths.authDir,
+          accountScopedAuthFileName(this.accountId, "sunat.json"),
+        ),
+        validationWatcher,
+        releasePageForReuse: (reusablePage) => {
+          this.reusableSunatPage = reusablePage;
+        },
         onStep,
         runId: submissionContext?.runId,
         boletasDownloadDir: submissionContext?.boletasDownloadDir,
         releasePage: (outcome) => this.releaseInvoicePage(outcome),
       });
     } catch (error) {
+      validationWatcher.stop();
       const artifacts: Artifact[] = [];
       if (!page.isClosed()) {
         await page.screenshot({ path: errorScreenshot, fullPage: true }).catch(() => undefined);
@@ -859,6 +955,19 @@ export class SunatPortalEmitter implements InvoiceEmitter {
   }
 
   private async loginIfNeeded(page: Page, onStep: StepReporter): Promise<void> {
+    const authPath = path.join(
+      this.config.dataPaths.authDir,
+      accountScopedAuthFileName(this.accountId, "sunat.json"),
+    );
+    if (fs.existsSync(authPath)) {
+      await onStep("SUNAT: encontré una sesión guardada; probaré primero el menú directo.");
+      await page.goto(this.profile.sunat.invoiceUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => undefined);
+      if (await isLoggedIn(page, this.profile.sunat.login.loggedInSelector)) {
+        return;
+      }
+      await onStep("SUNAT: la sesión guardada no alcanzó; haré login completo.");
+    }
+
     await performLoginFlow({
       page,
       login: this.profile.sunat.login,
@@ -866,11 +975,11 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       onStep,
       stepLabel: "Autenticando en SUNAT",
     });
+    await dismissSunatContactValidationSurface(page, onStep);
   }
 
   private async newContext(browser: Browser, authFileName: string): Promise<BrowserContext> {
     const authPath = path.join(this.config.dataPaths.authDir, authFileName);
-
     const context = fs.existsSync(authPath)
       ? await browser.newContext({ storageState: authPath })
       : await browser.newContext();
@@ -879,8 +988,25 @@ export class SunatPortalEmitter implements InvoiceEmitter {
     return context;
   }
 
-  private async getOrCreateSunatSession(): Promise<{ browser: Browser; context: BrowserContext }> {
+  private async getOrCreateSunatSession(forceHeadful = false): Promise<{ browser: Browser; context: BrowserContext }> {
     if (this.sunatSession && this.sunatSession.browser.isConnected()) {
+      if (forceHeadful && !this.sunatSessionIsHeadful) {
+        await this.closeSunatSession();
+      } else if (this.sunatSessionInvoiceCount >= this.config.sunatSessionMaxInvoices) {
+        await this.closeSunatSession();
+      } else {
+        this.sunatSessionInvoiceCount += 1;
+        return this.sunatSession;
+      }
+    }
+
+    if (this.sunatSession && !this.sunatSession.browser.isConnected()) {
+      this.sunatSession = undefined;
+      this.sunatSessionInvoiceCount = 0;
+    }
+
+    if (this.sunatSession && this.sunatSession.browser.isConnected()) {
+      this.sunatSessionInvoiceCount += 1;
       return this.sunatSession;
     }
 
@@ -890,7 +1016,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
 
     this.sunatSessionPromise = (async () => {
       const browser = await chromium.launch({
-        headless: !this.config.headful,
+        headless: !(SUNAT_REQUIRES_HEADFUL || forceHeadful || this.config.headful),
         slowMo: this.config.slowMoMs,
       });
       const context = await this.newContext(browser, accountScopedAuthFileName(this.accountId, "sunat.json"));
@@ -908,6 +1034,8 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       });
 
       this.sunatSession = session;
+      this.sunatSessionInvoiceCount = 1;
+      this.sunatSessionIsHeadful = forceHeadful || this.config.headful;
       return session;
     })();
 
@@ -917,14 +1045,63 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       this.sunatSessionPromise = undefined;
     }
   }
+
+  private async closeSunatSession(): Promise<void> {
+    const session = this.sunatSession ?? (await this.sunatSessionPromise?.catch(() => undefined));
+    this.sunatSession = undefined;
+    this.sunatSessionPromise = undefined;
+    this.sunatSessionInvoiceCount = 0;
+    this.sunatSessionIsHeadful = false;
+    this.reusableSunatPage = undefined;
+
+    if (!session) {
+      return;
+    }
+
+    await session.context.close().catch(() => undefined);
+    await session.browser.close().catch(() => undefined);
+  }
+
+  private takeReusableSunatPage(context: BrowserContext): Page | undefined {
+    const page = this.reusableSunatPage;
+    this.reusableSunatPage = undefined;
+    if (!page || page.isClosed()) {
+      return undefined;
+    }
+    return page.context() === context ? page : undefined;
+  }
 }
 
-function startSunatValidationIframeSearchLogger(page: Page, onStep: StepReporter): void {
-  const POLL_INTERVAL_MS = 1_500;
+function startSunatValidationIframeSearchLogger(
+  page: Page,
+  onStep: StepReporter,
+  options?: { initiallyPaused?: boolean },
+): SunatValidationWatcherController {
+  const POLL_INTERVAL_MS = SUNAT_TIMING.validationIframePollMs;
+  let paused = options?.initiallyPaused ?? false;
+  let stopped = false;
+
+  const controller: SunatValidationWatcherController = {
+    pause: () => {
+      paused = true;
+    },
+    resume: () => {
+      paused = false;
+    },
+    stop: () => {
+      stopped = true;
+    },
+    isPaused: () => paused,
+  };
 
   void (async () => {
-    while (!page.isClosed()) {
+    while (!page.isClosed() && !stopped) {
       try {
+        if (paused || (await shouldSuspendSunatValidationWatcher(page))) {
+          await page.waitForTimeout(POLL_INTERVAL_MS).catch(() => undefined);
+          continue;
+        }
+
         await onStep("SUNAT: buscando iframe #ifrVCE");
         const found = await page
           .evaluate(() => {
@@ -939,8 +1116,8 @@ function startSunatValidationIframeSearchLogger(page: Page, onStep: StepReporter
           .catch(() => false);
         await onStep(found ? "SUNAT: iframe #ifrVCE encontrado" : "SUNAT: iframe #ifrVCE no encontrado");
         if (found) {
-          await onStep("SUNAT: iframe #ifrVCE encontrado; esperaré 1s antes de buscar los botones.");
-          await page.waitForTimeout(1_000).catch(() => undefined);
+          await onStep("SUNAT: iframe #ifrVCE encontrado; haré una pausa corta antes de buscar los botones.");
+          await page.waitForTimeout(SUNAT_TIMING.validationIframePostFoundPauseMs).catch(() => undefined);
           const finalized = await tryClickSunatValidationFinalizeButton(page, onStep);
 
           if (!finalized) {
@@ -969,6 +1146,19 @@ function startSunatValidationIframeSearchLogger(page: Page, onStep: StepReporter
       await page.waitForTimeout(POLL_INTERVAL_MS).catch(() => undefined);
     }
   })();
+
+  return controller;
+}
+
+async function shouldSuspendSunatValidationWatcher(page: Page): Promise<boolean> {
+  const selectors = [
+    "#dialogItem",
+    "#numeroComprobante",
+    "#dijit_form_Button_2_label",
+    ...finalSubmitSelectors("#boleta-preliminar\\.botonGrabarDocumento"),
+  ];
+
+  return isAnyVisibleLocatorInPageTree(page, selectors);
 }
 
 async function tryClickSunatValidationFinalizeButton(
@@ -1001,7 +1191,7 @@ async function tryClickSunatValidationFinalizeButton(
       await onStep("SUNAT: falló el click en #btnFinalizarValidacionDatos; seguiré buscando.");
       return false;
     }
-    await page.waitForTimeout(250).catch(() => undefined);
+    await page.waitForTimeout(SUNAT_TIMING.itemDialogPollMs).catch(() => undefined);
     return true;
   }
 
@@ -1037,7 +1227,7 @@ async function tryClickSunatValidationContinueWithoutConfirmButton(
       await onStep("SUNAT: falló el click en #btnCerrar; seguiré buscando.");
       return false;
     }
-    await page.waitForTimeout(250).catch(() => undefined);
+    await page.waitForTimeout(SUNAT_TIMING.itemDialogPollMs).catch(() => undefined);
     return true;
   }
 
@@ -1047,6 +1237,7 @@ async function tryClickSunatValidationContinueWithoutConfirmButton(
 
 class PendingSunatSubmission implements PreparedSubmission {
   private cleanupStarted = false;
+  private keepPageForReuse = false;
   private readonly interruptionSignal: Promise<string>;
   private resolveInterruption?: (message: string) => void;
 
@@ -1061,6 +1252,9 @@ class PendingSunatSubmission implements PreparedSubmission {
       profile: SiteProfile;
       preSubmitArtifacts: Artifact[];
       config: AppConfig;
+      sunatAuthFilePath: string;
+      validationWatcher: SunatValidationWatcherController;
+      releasePageForReuse?: (page: Page) => void;
       onStep: StepReporter;
       runId?: string;
       boletasDownloadDir?: string;
@@ -1104,16 +1298,19 @@ class PendingSunatSubmission implements PreparedSubmission {
 
     try {
       await onStep("Enviando factura en SUNAT");
-      await continueSunatBoletaWizard(this.params.page, this.params.profile, onStep);
+      this.params.validationWatcher.resume();
+      await continueSunatBoletaWizard(this.params.page, this.params.profile, onStep, {
+        allowImmediateFinalStage: true,
+      });
 
       await onStep("Buscando el botón Emitir de la preliminar.");
-      const submitButton = await waitForVisibleLocatorInPageTree(
+      const submitButton = await waitForAnyVisibleLocatorInPageTree(
         this.params.page,
         this.params.profile.sunat.finalSubmitSelector,
         15_000,
       );
       await onStep(`Botón Emitir encontrado (${await describeLocatorIdentity(submitButton.locator)}); haré click.`);
-      await submitButton.locator.click();
+      await clickSunatAction(this.params.page, submitButton.locator, onStep, "Emitir");
       await onStep("Click en Emitir realizado; esperando la confirmación.");
       await waitForSunatProcessingToSettle(this.params.page, "la emisión preliminar", onStep, 25_000);
 
@@ -1152,10 +1349,12 @@ class PendingSunatSubmission implements PreparedSubmission {
         25_000,
       );
       await onStep(`Pantalla final detectada (${await describeLocatorIdentity(successMarker.locator)}).`);
-      await this.params.page.screenshot({ path: confirmationScreenshot, fullPage: true });
-      artifacts.push({ kind: "screenshot", path: confirmationScreenshot });
+      if (this.params.config.debugArtifacts) {
+        await this.params.page.screenshot({ path: confirmationScreenshot, fullPage: true });
+        artifacts.push({ kind: "screenshot", path: confirmationScreenshot });
+      }
       await this.params.context.storageState({
-        path: path.join(this.params.config.dataPaths.authDir, "sunat.json"),
+        path: this.params.sunatAuthFilePath,
       });
 
       await onStep("Leyendo el número de comprobante emitido.");
@@ -1292,7 +1491,8 @@ async function launchBrowser(config: AppConfig): Promise<Browser> {
   });
 }
 
-async function newFalabellaContext(browser: Browser): Promise<BrowserContext> {
+async function newFalabellaContext(browser: Browser, authPath?: string): Promise<BrowserContext> {
+  void authPath;
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
   await context.addInitScript((entries) => {
     const hn = window.location.hostname.toLowerCase();
@@ -1723,8 +1923,15 @@ async function loginToFalabella(
   ]);
 
   if (await emailField.isVisible().catch(() => false)) {
-    await onStep("Falabella login: rellenando email.");
+    await onStep(`Falabella login: rellenando email seleccionado: ${credentials.username}.`);
+    await emailField.fill("");
     await emailField.fill(credentials.username);
+    const filledEmail = await emailField.inputValue().catch(() => "");
+    if (filledEmail.trim().toLowerCase() !== credentials.username.trim().toLowerCase()) {
+      throw new AutomationError(
+        `Falabella login: el campo email quedó con "${filledEmail}" pero la cuenta seleccionada es "${credentials.username}".`,
+      );
+    }
 
     let passwordField = await findVisibleFalabellaLoginPasswordField(page);
 
@@ -1786,6 +1993,7 @@ async function loginToFalabella(
 async function openFalabellaDocumentsPage(
   page: Page,
   url: string,
+  config: AppConfig,
   onStep: StepReporter,
 ): Promise<void> {
   await onStep("Abriendo Documentos tributarios en Falabella");
@@ -1803,6 +2011,11 @@ async function openFalabellaDocumentsPage(
     await onStep("Falabella documentos: ya cargué la URL de Documentos tributarios tras el login; esperando la tabla.");
   }
 
+  if (await isFalabellaLoginSurface(page)) {
+    await onStep("Falabella documentos: detecté un retorno al login; reautentico antes de esperar la tabla.");
+    await loginToFalabella(page, config.sellerCredentials, onStep, url);
+  }
+
   await onStep(
     "Falabella documentos: esperando tabla de órdenes o lista vacía (hasta 25s).",
   );
@@ -1817,10 +2030,53 @@ async function openFalabellaDocumentsPage(
     timeout: 60_000,
   });
   await persistFalabellaLocalStorage(page);
+  if (await isFalabellaLoginSurface(page)) {
+    await onStep("Falabella documentos: tras el reintento seguí en login; vuelvo a autenticar antes de medir la tabla.");
+    await loginToFalabella(page, config.sellerCredentials, onStep, url);
+  }
 
   readyState = await waitForFalabellaDocumentsReadyState(page, onStep, 25_000);
   if (readyState === "timeout") {
+    await logFalabellaDocumentsPageFailure(page, config, onStep);
     throw new Error("Falabella no mostró la tabla de Documentos tributarios a tiempo.");
+  }
+}
+
+async function isFalabellaLoginSurface(page: Page): Promise<boolean> {
+  if (/sellercenter\.falabella\.com\/user\/auth\/login/i.test(page.url())) {
+    return true;
+  }
+
+  const emailVisible = await page.locator("#email").first().isVisible().catch(() => false);
+  if (emailVisible) {
+    return true;
+  }
+
+  return page.locator("#password, input[type='password']").first().isVisible().catch(() => false);
+}
+
+async function logFalabellaDocumentsPageFailure(
+  page: Page,
+  config: AppConfig,
+  onStep: StepReporter,
+): Promise<void> {
+  const url = page.url();
+  const title = await page.title().catch(() => "");
+  const bodyText = ((await page.locator("body").textContent().catch(() => "")) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const bodySnippet = bodyText ? truncateForLog(bodyText, 280) : "sin texto visible";
+  const screenshotPath = path.join(
+    config.dataPaths.screenshotsDir,
+    `falabella-documents-timeout-${Date.now()}.png`,
+  );
+
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+  await onStep(
+    `Falabella documentos timeout: URL=${url || "sin URL"} · title=${title || "sin title"} · texto=${bodySnippet}.`,
+  );
+  if (fs.existsSync(screenshotPath)) {
+    await onStep(`Falabella documentos timeout: screenshot guardado en ${screenshotPath}.`);
   }
 }
 
@@ -3339,21 +3595,94 @@ async function extractEnabledFalabellaRow(
 async function waitForFalabellaOrderDetailReady(
   detailPage: Page,
   detailUrl: string,
+  config: AppConfig,
+  orderId: string,
+  onStep?: StepReporter,
 ): Promise<Record<string, string>> {
   await detailPage.goto(detailUrl, {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
-  await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
-    state: "visible",
-    timeout: 30_000,
-  });
-  await detailPage.locator(".card-details .row.my-1").first().waitFor({
-    state: "visible",
-    timeout: 15_000,
-  });
+
+  try {
+    await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
+      state: "visible",
+      timeout: 30_000,
+    });
+    await detailPage.locator(".card-details .row.my-1").first().waitFor({
+      state: "visible",
+      timeout: 15_000,
+    });
+  } catch (error) {
+    throw await buildFalabellaOrderDetailError(
+      detailPage,
+      config,
+      orderId,
+      "la apertura inicial del detalle",
+      error,
+      onStep,
+    );
+  }
+
   await detailPage.waitForTimeout(2_000);
   return readFalabellaDetailMap(detailPage);
+}
+
+async function buildFalabellaOrderDetailError(
+  detailPage: Page,
+  config: AppConfig,
+  orderId: string,
+  phase: string,
+  cause: unknown,
+  onStep?: StepReporter,
+): Promise<Error> {
+  const finalUrl = detailPage.url();
+  const title = await detailPage.title().catch(() => "");
+  const bodyText = ((await detailPage.locator("body").textContent().catch(() => "")) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const visibleHeadings = await detailPage
+    .locator("h1, h2, h3, [role='heading']")
+    .evaluateAll((elements) =>
+      elements
+        .map((element) => (element.textContent || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .slice(0, 6),
+    )
+    .catch(() => [] as string[]);
+  const screenshotPath = path.join(
+    config.dataPaths.screenshotsDir,
+    `falabella-detail-${orderId}-${Date.now()}.png`,
+  );
+
+  await detailPage.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+  const screenshotNote = fs.existsSync(screenshotPath) ? screenshotPath : undefined;
+  const rootMessage = cause instanceof Error ? cause.message : String(cause ?? "Error desconocido.");
+  const bodySnippet = bodyText ? truncateForLog(bodyText, 300) : "sin texto visible en body";
+  const headingsSnippet = visibleHeadings.length ? visibleHeadings.join(" | ") : "sin headings visibles";
+
+  await onStep?.(
+    `Falabella detalle ${orderId}: no apareció «Información del cliente» durante ${phase}. URL final: ${finalUrl || "sin URL"}.`,
+  );
+  await onStep?.(
+    `Falabella detalle ${orderId}: title=${title || "sin title"}; headings=${headingsSnippet}.`,
+  );
+  await onStep?.(`Falabella detalle ${orderId}: texto visible resumido: ${bodySnippet}.`);
+  if (screenshotNote) {
+    await onStep?.(`Falabella detalle ${orderId}: screenshot guardado en ${screenshotNote}.`);
+  }
+
+  return new Error(
+    [
+      `Falabella detalle ${orderId}: no apareció «Información del cliente» durante ${phase}.`,
+      `URL final: ${finalUrl || "sin URL"}`,
+      `Title: ${title || "sin title"}`,
+      `Headings visibles: ${headingsSnippet}`,
+      `Texto visible: ${bodySnippet}`,
+      screenshotNote ? `Screenshot: ${screenshotNote}` : "Screenshot: no disponible",
+      `Causa original: ${rootMessage}`,
+    ].join("\n"),
+  );
 }
 
 function falabellaDetailIndicatesFactura(detailMap: Record<string, string>): boolean {
@@ -3370,7 +3699,7 @@ async function readFalabellaSaleFromDetail(
   detailPage: Page,
   row: FalabellaRowCandidate,
   config: AppConfig,
-  options?: { initialDetailMap?: Record<string, string> },
+  options?: { initialDetailMap?: Record<string, string>; onStep?: StepReporter },
 ): Promise<Sale> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let detailMap: Record<string, string>;
@@ -3383,14 +3712,27 @@ async function readFalabellaSaleFromDetail(
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
-      await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
-        state: "visible",
-        timeout: 30_000,
-      });
-      await detailPage.locator(".card-details .row.my-1").first().waitFor({
-        state: "visible",
-        timeout: 15_000,
-      });
+
+      try {
+        await detailPage.getByText(/Informaci[oó]n del cliente/i).first().waitFor({
+          state: "visible",
+          timeout: 30_000,
+        });
+        await detailPage.locator(".card-details .row.my-1").first().waitFor({
+          state: "visible",
+          timeout: 15_000,
+        });
+      } catch (error) {
+        throw await buildFalabellaOrderDetailError(
+          detailPage,
+          config,
+          row.externalId,
+          `la recarga del detalle (intento ${attempt + 1})`,
+          error,
+          options?.onStep,
+        );
+      }
+
       await detailPage.waitForTimeout(attempt === 0 ? 2_000 : 4_000);
       detailMap = await readFalabellaDetailMap(detailPage);
     }
@@ -3402,10 +3744,11 @@ async function readFalabellaSaleFromDetail(
     const productDescription = await readFalabellaPrimaryProductDescription(detailPage, row.itemDocumentTypes);
     const computedTotal = total;
     const customerName = detailMap.cliente ?? "Cliente sin nombre";
-    const documentNumber =
+    const documentNumber = normalizeFalabellaCustomerDocumentNumber(
       detailMap["n identificacion"] ??
-      detailMap["numero identificacion"] ??
-      "";
+        detailMap["numero identificacion"] ??
+        "",
+    );
     const tributaryDocumentLabel = (detailMap["documento tributario"] ?? "").replace(/\s+/g, " ").trim();
     const requestedDocumentTypeFromDetail = normalizeFalabellaDocumentType(tributaryDocumentLabel);
 
@@ -3460,16 +3803,21 @@ async function persistFalabellaLocalStorage(page: Page): Promise<void> {
 
 async function readFalabellaDetailMap(page: Page): Promise<Record<string, string>> {
   const rows = await page.locator(".card-details .row.my-1").evaluateAll((elements) =>
-    elements.map((element) => {
+    elements.flatMap((element) => {
       const columns = Array.from(element.querySelectorAll(":scope > div"));
       if (columns.length < 2) {
-        return { label: "", value: "" };
+        return [];
       }
 
-      return {
-        label: (columns[0].textContent || "").replace(/\s+/g, " ").trim(),
-        value: (columns[1].textContent || "").replace(/\s+/g, " ").trim(),
-      };
+      const pairs: Array<{ label: string; value: string }> = [];
+      for (let index = 0; index + 1 < columns.length; index += 2) {
+        pairs.push({
+          label: (columns[index].textContent || "").replace(/\s+/g, " ").trim(),
+          value: (columns[index + 1].textContent || "").replace(/\s+/g, " ").trim(),
+        });
+      }
+
+      return pairs;
     }),
   );
 
@@ -3483,6 +3831,10 @@ async function readFalabellaDetailMap(page: Page): Promise<Record<string, string
   }
 
   return map;
+}
+
+export function normalizeFalabellaCustomerDocumentNumber(raw: string): string {
+  return raw.replace(/[^\d]/g, "");
 }
 
 async function readFalabellaProductCount(
@@ -3901,7 +4253,26 @@ async function performLoginFlow(params: {
 }): Promise<void> {
   const { page, login, credentials, onStep, stepLabel } = params;
 
-  await page.goto(login.loginUrl, { waitUntil: "domcontentloaded" });
+  let alreadyOnLoginSurface = await isLoginSurface(page, login);
+  if (!alreadyOnLoginSurface) {
+    alreadyOnLoginSurface = await waitForLoginSurfaceOrRedirect(page, login, login.loggedInSelector);
+  }
+
+  if (!alreadyOnLoginSurface) {
+    try {
+      await page.goto(login.loginUrl, { waitUntil: "domcontentloaded" });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? "");
+      const interruptedByRedirect =
+        /interrupted by another navigation/i.test(message) &&
+        (await waitForLoginSurfaceOrRedirect(page, login, login.loggedInSelector));
+      if (!interruptedByRedirect) {
+        throw error;
+      }
+    }
+  } else {
+    await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  }
 
   if (await isLoggedIn(page, login.loggedInSelector)) {
     return;
@@ -3909,12 +4280,27 @@ async function performLoginFlow(params: {
 
   const usernameField = page.locator(login.usernameSelector).first();
   const passwordField = page.locator(login.passwordSelector).first();
-  const shouldLogin =
+  let shouldLogin =
     (await usernameField.isVisible().catch(() => false)) ||
     (await passwordField.isVisible().catch(() => false));
 
   if (!shouldLogin) {
-    return;
+    const visibilityChecks = [
+      usernameField.waitFor({ state: "visible", timeout: 5_000 }).catch(() => undefined),
+      passwordField.waitFor({ state: "visible", timeout: 5_000 }).catch(() => undefined),
+    ];
+    if (login.loggedInSelector) {
+      visibilityChecks.push(
+        page.locator(login.loggedInSelector).first().waitFor({ state: "visible", timeout: 5_000 }).catch(() => undefined),
+      );
+    }
+    await Promise.race(visibilityChecks);
+    shouldLogin =
+      (await usernameField.isVisible().catch(() => false)) ||
+      (await passwordField.isVisible().catch(() => false));
+    if (!shouldLogin) {
+      return;
+    }
   }
 
   await onStep(stepLabel);
@@ -3923,7 +4309,7 @@ async function performLoginFlow(params: {
     const rucTab = page.locator(login.rucTabSelector).first();
     if (await rucTab.isVisible().catch(() => false)) {
       await rucTab.click().catch(() => undefined);
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(SUNAT_TIMING.loginPostRucTabPauseMs);
     }
   }
 
@@ -3950,8 +4336,9 @@ async function performLoginFlow(params: {
   const submitButton = page.locator(login.passwordSubmitSelector ?? login.submitSelector).first();
   await submitButton.click();
   await waitForLoginStep(page, undefined, login.loggedInSelector);
-  await page.waitForLoadState("networkidle").catch(() => undefined);
-}
+  await page
+    .waitForLoadState("networkidle", { timeout: SUNAT_TIMING.loginPostSubmitNetworkIdleTimeoutMs })
+    .catch(() => undefined);
 
 async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepReporter): Promise<void> {
   for (const label of labels) {
@@ -3959,6 +4346,254 @@ async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepRe
     const target = await waitForVisibleTextTargetInPageTree(page, label, 45_000);
     await target.scrollIntoViewIfNeeded();
     await target.click();
+  }
+
+  const loginStillVisible =
+    (await usernameField.isVisible().catch(() => false)) ||
+    (await passwordField.isVisible().catch(() => false));
+  if (!loginStillVisible) {
+    return;
+  }
+
+  await onStep(`${stepLabel}: el formulario sigue visible; reintento explícito con RUC/usuario/clave.`);
+
+  if (login.rucTabSelector) {
+    const rucTab = page.locator(login.rucTabSelector).first();
+    if (await rucTab.isVisible().catch(() => false)) {
+      await rucTab.click().catch(() => undefined);
+      await page.waitForTimeout(SUNAT_TIMING.loginPostRucTabPauseMs);
+    }
+  }
+
+  if (login.rucSelector && credentials.ruc) {
+    await page.locator(login.rucSelector).first().fill(credentials.ruc).catch(() => undefined);
+  }
+  await usernameField.fill(credentials.username).catch(() => undefined);
+  await passwordField.fill(credentials.password).catch(() => undefined);
+  await submitButton.click().catch(() => undefined);
+  await waitForLoginStep(page, undefined, login.loggedInSelector);
+  await page
+    .waitForLoadState("networkidle", { timeout: SUNAT_TIMING.loginPostSubmitNetworkIdleTimeoutMs })
+    .catch(() => undefined);
+}
+
+async function isLoginSurface(
+  page: Page,
+  login: SiteProfile["seller"]["login"] | SiteProfile["sunat"]["login"],
+): Promise<boolean> {
+  const usernameVisible = await page.locator(login.usernameSelector).first().isVisible().catch(() => false);
+  const passwordVisible = await page.locator(login.passwordSelector).first().isVisible().catch(() => false);
+  if (usernameVisible || passwordVisible) {
+    return true;
+  }
+
+  const currentUrl = page.url();
+  return currentUrl.startsWith(login.loginUrl) || /clientessol|user\/auth\/login/i.test(currentUrl);
+}
+
+async function waitForLoginSurfaceOrRedirect(
+  page: Page,
+  login: SiteProfile["seller"]["login"] | SiteProfile["sunat"]["login"],
+  loggedInSelector?: string,
+  timeoutMs = 8_000,
+): Promise<boolean> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await isLoginSurface(page, login)) {
+      return true;
+    }
+    if (loggedInSelector && (await isLoggedIn(page, loggedInSelector))) {
+      return true;
+    }
+    await page.waitForTimeout(250).catch(() => undefined);
+  }
+
+  return isLoginSurface(page, login);
+}
+
+async function navigateSunatSolMenu(
+  page: Page,
+  labels: string[],
+  profile: SiteProfile,
+  invoiceUrl: string,
+  config: AppConfig,
+  onStep: StepReporter,
+): Promise<void> {
+  await ensureSunatMenuSurface(page, invoiceUrl, onStep, "preparar el menú SOL");
+  await dismissSunatContactValidationSurface(page, onStep);
+
+  for (let index = 0; index < labels.length; index += 1) {
+    if (await isSunatBoletaWorkflowSurface(page, profile)) {
+      await onStep(
+        "SUNAT ya está dentro del formulario de boleta; no seguiré navegando niveles del menú SOL.",
+      );
+      return;
+    }
+
+    const label = labels[index];
+    await onStep(`Menú SUNAT: ${label}`);
+    await dismissSunatContactValidationSurface(page, onStep);
+    const target = await tryFindVisibleTextTargetInPageTree(page, label, 15_000);
+    if (!target) {
+      await ensureSunatMenuSurface(page, invoiceUrl, onStep, `buscar el menú "${label}"`);
+      await dismissSunatContactValidationSurface(page, onStep);
+      if (await isSunatBoletaWorkflowSurface(page, profile)) {
+        await onStep(
+          `SUNAT ya quedó dentro del flujo de boleta mientras buscaba "${label}"; continuaré sin exigir más niveles del menú.`,
+        );
+        return;
+      }
+      const nextVisibleLabel = await findFirstVisibleSunatMenuLabel(page, labels.slice(index + 1), 2_000);
+      if (nextVisibleLabel) {
+        await onStep(
+          `Menú SUNAT: no apareció "${label}", pero ya veo "${nextVisibleLabel}"; omito ese nivel y continúo.`,
+        );
+        continue;
+      }
+      const state = await describeSunatPageState(page);
+      await onStep(
+        `SUNAT menú: no vi "${label}". URL=${state.url || "sin URL"} · title=${state.title || "sin title"} · texto=${state.bodySnippet}.`,
+      );
+      await captureSunatMenuFailureEvidence(page, config, onStep, label);
+      throw new Error(`No se encontró un menú SUNAT visible para "${label}".`);
+    }
+    await clickSunatAction(page, target, onStep, `Menú SUNAT: ${label}`);
+    await page.waitForTimeout(SUNAT_TIMING.menuClickPauseMs);
+  }
+}
+
+async function isSunatBoletaWorkflowSurface(
+  page: Page,
+  profile: SiteProfile,
+  preferredScope?: PageScope,
+): Promise<boolean> {
+  return isAnyVisibleLocatorInPageTree(
+    page,
+    [
+      ...customerDocumentSelectors(profile.sunat.customerDocumentSelector),
+      ...customerNameSelectors(profile.sunat.customerNameSelector),
+      ...customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar"),
+      ...addItemButtonSelectors(profile.sunat.addItemButtonSelector),
+      ...preliminarySunatStepMarkers(),
+      ...finalSubmitSelectors(profile.sunat.finalSubmitSelector),
+    ].filter(Boolean),
+    preferredScope,
+  ).catch(() => false);
+}
+
+async function findFirstVisibleSunatMenuLabel(
+  page: Page,
+  labels: string[],
+  timeoutMs: number,
+): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    for (const label of labels) {
+      const target = await tryFindVisibleTextTargetInPageTree(page, label, 100);
+      if (target) {
+        return label;
+      }
+    }
+    await page.waitForTimeout(150);
+  }
+
+  return undefined;
+}
+
+async function ensureSunatMenuSurface(
+  page: Page,
+  invoiceUrl: string,
+  onStep: StepReporter,
+  contextLabel: string,
+): Promise<void> {
+  let state = await describeSunatPageState(page);
+  if (!state.looksBlank) {
+    await dismissSunatContactValidationSurface(page, onStep);
+    return;
+  }
+
+  await onStep(
+    `SUNAT parece en blanco al ${contextLabel}; recargaré la vista. URL=${state.url || "sin URL"} · title=${state.title || "sin title"}.`,
+  );
+  await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+  await page.waitForTimeout(500).catch(() => undefined);
+  state = await describeSunatPageState(page);
+  if (!state.looksBlank) {
+    return;
+  }
+
+  await onStep(
+    `SUNAT sigue en blanco tras recargar; abriré directamente ${invoiceUrl}.`,
+  );
+  await page.goto(invoiceUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => undefined);
+  await page.waitForTimeout(750).catch(() => undefined);
+  state = await describeSunatPageState(page);
+  await dismissSunatContactValidationSurface(page, onStep);
+  await onStep(
+    `Estado SUNAT tras recuperación: URL=${state.url || "sin URL"} · title=${state.title || "sin title"} · texto=${state.bodySnippet}.`,
+  );
+}
+
+function shouldRetrySunatHeadfulAfterError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /ERR_CONNECTION_RESET|chrome-error:\/\/chromewebdata|ERR_HTTP2_PROTOCOL_ERROR/i.test(message);
+}
+
+async function shouldRetrySunatInHeadful(page: Page): Promise<boolean> {
+  if (page.isClosed()) {
+    return false;
+  }
+  const state = await describeSunatPageState(page);
+  return page.url().startsWith("chrome-error://") || state.looksBlank;
+}
+
+async function describeSunatPageState(page: Page): Promise<{
+  url: string;
+  title: string;
+  bodySnippet: string;
+  looksBlank: boolean;
+}> {
+  const url = page.url();
+  const title = await page.title().catch(() => "");
+  const bodyText = ((await page.locator("body").textContent().catch(() => "")) ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const bodySnippet = bodyText ? truncateForLog(bodyText, 180) : "sin texto visible";
+  const looksBlank = !title.trim() && bodyText.length < 20;
+
+  return {
+    url,
+    title: title.trim(),
+    bodySnippet,
+    looksBlank,
+  };
+}
+
+async function captureSunatMenuFailureEvidence(
+  page: Page,
+  config: AppConfig,
+  onStep: StepReporter,
+  label: string,
+): Promise<void> {
+  const screenshotPath = path.join(
+    config.dataPaths.screenshotsDir,
+    `sunat-menu-failure-${Date.now()}.png`,
+  );
+  const frameSummary = page
+    .frames()
+    .map((frame, index) => `[${index}] ${frame.url() || "about:blank"}`)
+    .slice(0, 12)
+    .join(" | ");
+  const visibleControls = await describeVisibleControlsInPageTree(page);
+
+  await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+  await onStep(
+    `SUNAT menú fallo "${label}": frames=${frameSummary || "sin frames"} · controles=${visibleControls}.`,
+  );
+  if (fs.existsSync(screenshotPath)) {
+    await onStep(`SUNAT menú fallo "${label}": screenshot guardado en ${screenshotPath}.`);
   }
 }
 
@@ -3982,8 +4617,8 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
     win[installKey] = true;
 
     let tickSeq = 0;
-    const POLL_INTERVAL_MS = 1_500;
-    const POLL_INTERVAL_LABEL = "1.5 s";
+    const POLL_INTERVAL_MS = 750;
+    const POLL_INTERVAL_LABEL = "0.75 s";
 
     function logTraceBlock(_lines: string[]): void {
       /* trace logging intentionally disabled; keep simple live logs only */
@@ -4067,6 +4702,24 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
       trace.push(`   · ${label}: oculto visualmente (visibility:hidden, opacity:0, pointer-events:none).`);
     }
 
+    function clickElement(el: HTMLElement, trace: string[], label: string): boolean {
+      try {
+        el.scrollIntoView({ block: "center", inline: "center" });
+      } catch {
+        /* ignore */
+      }
+
+      try {
+        el.click();
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+        trace.push(`   · ${label}: click disparado.`);
+        return true;
+      } catch (error) {
+        trace.push(`   · ${label}: falló el click (${String((error as Error)?.message || error)}).`);
+        return false;
+      }
+    }
+
     function tryDismissContactValidationModals(): void {
       tickSeq += 1;
       const isTop = window === window.top;
@@ -4118,7 +4771,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
               );
               const inTree = document.documentElement.contains(divModalCampana);
               trace.push(`   · conectado al documento actual: ${inTree ? "sí" : "no"}`);
-              hideBlockingSurface(divModalCampana, trace, "#divModalCampana");
+              trace.push("   · mantengo visible #divModalCampana hasta intentar clickear los botones del flujo.");
             }
           }
 
@@ -4160,7 +4813,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
             trace.push(`   · detalle: id=ifrVCE name=${nm || "—"}`);
             const srcAttr = (ifrVce.getAttribute("src") || "").slice(0, 160);
             trace.push(`   · src (recortado): ${srcAttr || "(vacío)"}`);
-            hideBlockingSurface(ifrVce, trace, 'iframe #ifrVCE');
+            trace.push("   · mantengo visible el iframe hasta intentar cerrar el flujo de contacto.");
             let access = "";
             try {
               access = ifrVce.contentDocument
@@ -4230,6 +4883,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
 
       trace.push("Paso 4 · Buscar #btnFinalizarValidacionDatos (visible) por documento…");
       let anyFinalizarNode = false;
+      let clickedFinalizar = false;
       for (let d = 0; d < docs.length; d += 1) {
         const doc = docs[d];
         const el = doc.getElementById("btnFinalizarValidacionDatos");
@@ -4240,13 +4894,47 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
         anyFinalizarNode = true;
         const vis = el instanceof HTMLElement && elementLooksVisibleInDocument(el, doc);
         trace.push(`   · doc[${d}]: nodo presente · visible=${vis ? "SÍ (acción: click Finalizar)" : "no"}`);
+        if (vis && el instanceof HTMLElement && clickElement(el, trace, `doc[${d}] #btnFinalizarValidacionDatos`)) {
+          clickedFinalizar = true;
+          break;
+        }
       }
       if (!anyFinalizarNode) {
         trace.push("   · ningún doc tiene #btnFinalizarValidacionDatos");
       }
 
+      if (!clickedFinalizar) {
+        trace.push("Paso 4b · Buscar botón visible con texto «Finalizar» en documentos same-origin…");
+        for (let d = 0; d < docs.length; d += 1) {
+          const doc = docs[d];
+          const candidates = Array.from(
+            doc.querySelectorAll<HTMLElement>("button, input[type='button'], input[type='submit'], a, span"),
+          );
+          const target = candidates.find((candidate) => {
+            const label = (
+              candidate.textContent ||
+              candidate.getAttribute("value") ||
+              candidate.getAttribute("aria-label") ||
+              ""
+            )
+              .replace(/\s+/g, " ")
+              .trim();
+            return /finalizar/i.test(label) && elementLooksVisibleInDocument(candidate, doc);
+          });
+          if (!target) {
+            trace.push(`   · doc[${d}]: no veo botón «Finalizar» accionable`);
+            continue;
+          }
+          if (clickElement(target, trace, `doc[${d}] botón "Finalizar"`)) {
+            clickedFinalizar = true;
+            break;
+          }
+        }
+      }
+
       trace.push('Paso 5 · Buscar #btnCerrar coherente (onclick callHide o texto «Continuar sin confirmar»)…');
       let anyCerrarNode = false;
+      let clickedCerrar = false;
       for (let d = 0; d < docs.length; d += 1) {
         const doc = docs[d];
         const el = doc.getElementById("btnCerrar");
@@ -4264,9 +4952,53 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
         trace.push(
           `   · doc[${d}]: btnCerrar presente · coincide patrón=${matches ? "sí" : "no"} · visible=${vis ? "SÍ" : "no"} · texto=${label || "—"}`,
         );
+        if (matches && vis && el instanceof HTMLElement && clickElement(el, trace, `doc[${d}] #btnCerrar`)) {
+          clickedCerrar = true;
+          break;
+        }
       }
       if (!anyCerrarNode) {
         trace.push("   · ningún doc tiene #btnCerrar");
+      }
+
+      if (!clickedCerrar) {
+        trace.push('Paso 5b · Buscar botón visible con texto «Continuar sin confirmar»…');
+        for (let d = 0; d < docs.length; d += 1) {
+          const doc = docs[d];
+          const candidates = Array.from(
+            doc.querySelectorAll<HTMLElement>("button, input[type='button'], input[type='submit'], a, span"),
+          );
+          const target = candidates.find((candidate) => {
+            const label = (
+              candidate.textContent ||
+              candidate.getAttribute("value") ||
+              candidate.getAttribute("aria-label") ||
+              ""
+            )
+              .replace(/\s+/g, " ")
+              .trim();
+            return /continuar\s+sin\s+confirmar/i.test(label) && elementLooksVisibleInDocument(candidate, doc);
+          });
+          if (!target) {
+            trace.push(`   · doc[${d}]: no veo botón «Continuar sin confirmar» accionable`);
+            continue;
+          }
+          if (clickElement(target, trace, `doc[${d}] botón "Continuar sin confirmar"`)) {
+            clickedCerrar = true;
+            break;
+          }
+        }
+      }
+
+      if (clickedFinalizar || clickedCerrar) {
+        const topCampana = document.getElementById("divModalCampana");
+        if (topCampana instanceof HTMLElement) {
+          hideBlockingSurface(topCampana, trace, "#divModalCampana");
+        }
+        const topIframe = document.getElementById("ifrVCE");
+        if (topIframe instanceof HTMLElement) {
+          hideBlockingSurface(topIframe, trace, "#ifrVCE");
+        }
       }
 
       trace.push(
@@ -4389,6 +5121,36 @@ async function waitForAnyVisibleLocatorInPageTree(
   );
 }
 
+async function waitForAnyVisibleLocatorWithinRoot(
+  root: Locator,
+  selectors: string[],
+  timeoutMs: number,
+): Promise<Locator> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    for (const selector of selectors) {
+      const locator = root.locator(selector);
+      const count = await locator.count().catch(() => 0);
+
+      if (!count) {
+        continue;
+      }
+
+      for (let index = 0; index < Math.min(count, 20); index += 1) {
+        const candidate = locator.nth(index);
+        if (await candidate.isVisible().catch(() => false)) {
+          return candidate;
+        }
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(`No se encontró un elemento visible dentro del contenedor para: ${selectors.join(" | ")}`);
+}
+
 async function waitForBottomMostVisibleLocatorInPageTree(
   page: Page,
   selectors: string[],
@@ -4495,7 +5257,7 @@ async function waitForAutofilledCustomerName(
   if (sunatInconsistentDniRecovery) {
     const rawDoc = sunatInconsistentDniRecovery.draft.customer.documentNumber || "";
     await onStep?.(
-      `SUNAT: esperando el nombre del cliente en ${fieldIdentity}. Si SUNAT muestra el modal «documento de identidad inconsistente», lo cierro, pongo tipo Sin documento y escribo el nombre del draft (${truncateForLog(rawDoc, 24)}).`,
+      `SUNAT: esperando el nombre del cliente en ${fieldIdentity}. Si SUNAT muestra el modal «documento de identidad inconsistente», omitiré esta venta y seguiré con las demás (${truncateForLog(rawDoc, 24)}).`,
     );
   }
 
@@ -4551,6 +5313,42 @@ async function waitForAutofilledCustomerName(
     await page.waitForTimeout(250);
   }
 
+  if (expectedName.trim()) {
+    await onStep?.(
+      `SUNAT no autocompletó el nombre a tiempo; intentaré usar el nombre del draft manualmente en ${fieldIdentity}.`,
+    );
+
+    const editable = await field.locator.isEditable().catch(() => false);
+    if (editable) {
+      await field.locator.click().catch(() => undefined);
+      await field.locator.fill(expectedName).catch(() => undefined);
+      await field.locator.press("Tab").catch(() => undefined);
+    } else {
+      await field.locator
+        .evaluate((element, value) => {
+          if (!(element instanceof HTMLInputElement)) {
+            throw new Error("El campo de nombre no es un input editable.");
+          }
+          element.removeAttribute("disabled");
+          element.removeAttribute("aria-disabled");
+          element.disabled = false;
+          element.value = value;
+          element.setAttribute("value", value);
+          element.dispatchEvent(new Event("input", { bubbles: true }));
+          element.dispatchEvent(new Event("change", { bubbles: true }));
+          element.dispatchEvent(new Event("blur", { bubbles: true }));
+        }, expectedName)
+        .catch(() => undefined);
+    }
+
+    await page.waitForTimeout(300).catch(() => undefined);
+    const fallbackValue = await readLocatorValue(field.locator);
+    if (normalizeComparableText(fallbackValue)) {
+      await onStep?.(`SUNAT: nombre cargado manualmente en ${fieldIdentity}: ${truncateForLog(fallbackValue, 80)}`);
+      return field;
+    }
+  }
+
   const docHint =
     sunatInconsistentDniRecovery?.draft.customer.documentNumber !== undefined
       ? ` Cliente: ${truncateForLog(sunatInconsistentDniRecovery.draft.customer.documentNumber, 32)} (${sunatInconsistentDniRecovery.draft.customer.documentNumber.replace(/\D+/g, "").length} dígitos).`
@@ -4599,12 +5397,26 @@ async function resolveSunatInicioTipoDocumentoControls(
   );
 }
 
-/** Tras el modal de inconsistencia: abre el desplegable y elige SIN DOCUMENTO (control id inicio.tipoDocumento, suele ser un input Dojo). */
-async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: StepReporter): Promise<void> {
-  const normalizedTarget = "sin documento";
+async function selectSunatInicioTipoDocumentoByLabel(
+  page: Page,
+  targetLabel: string,
+  onStep?: StepReporter,
+): Promise<void> {
+  const normalizedTarget = targetLabel
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  const aliasTargets =
+    normalizedTarget === "documento nacional de identidad"
+      ? [normalizedTarget, "doc. nacional de identidad", "dni"]
+      : normalizedTarget === "registro unico de contribuyentes"
+        ? [normalizedTarget, "ruc"]
+        : [normalizedTarget];
 
   await onStep?.(
-    'SUNAT: elijo «Sin documento»: hago clic en el campo id="inicio.tipoDocumento" (input/combo) para abrir la lista y selecciono la opción.',
+    `SUNAT: elijo «${targetLabel}»: hago clic en el campo id="inicio.tipoDocumento" (input/combo) para abrir la lista y selecciono la opción.`,
   );
 
   const { fieldLoc, widgetLoc } = await resolveSunatInicioTipoDocumentoControls(page, 30_000, onStep);
@@ -4634,7 +5446,7 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
           .replace(/\s+/g, " ")
           .trim()
           .toLowerCase();
-        if (!norm.includes(normalizedTarget)) {
+        if (!aliasTargets.some((alias) => norm.includes(alias))) {
           continue;
         }
         await onStep?.(`SUNAT: en la lista abierta elijo «${raw.trim()}».`);
@@ -4686,7 +5498,7 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
 
   if (await clickMenuSinDocumento()) {
     await page.waitForTimeout(200);
-    await onStep?.('SUNAT: quedó «Sin documento» en tipo de documento (id=inicio.tipoDocumento).');
+    await onStep?.(`SUNAT: quedó «${targetLabel}» en tipo de documento (id=inicio.tipoDocumento).`);
     return;
   }
 
@@ -4696,7 +5508,7 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
 
   if (await clickMenuSinDocumento()) {
     await page.waitForTimeout(200);
-    await onStep?.('SUNAT: quedó «Sin documento» en tipo de documento (id=inicio.tipoDocumento).');
+    await onStep?.(`SUNAT: quedó «${targetLabel}» en tipo de documento (id=inicio.tipoDocumento).`);
     return;
   }
 
@@ -4707,13 +5519,13 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
     await page.waitForTimeout(400);
     if (await clickMenuSinDocumento()) {
       await page.waitForTimeout(200);
-      await onStep?.('SUNAT: quedó «Sin documento» vía flecha del combo.');
+      await onStep?.(`SUNAT: quedó «${targetLabel}» vía flecha del combo.`);
       return;
     }
   }
 
   const domFallback = await fieldLoc
-    .evaluate((root) => {
+    .evaluate((root, targetAliases: string[]) => {
       const from = root as Element;
 
       function normText(s: string): string {
@@ -4743,7 +5555,7 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
         return g instanceof HTMLInputElement ? g : null;
       }
 
-      function findSinDocumentoPair(): { value: string; label: string } | null {
+      function findTargetPair(): { value: string; label: string } | null {
         const roots: Element[] = [];
         const w = from.closest("[widgetid]");
         if (w) {
@@ -4764,7 +5576,7 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
           for (const sel of Array.from(c.querySelectorAll("select"))) {
             for (const opt of Array.from(sel.options)) {
               const t = normText(opt.label || opt.textContent || "");
-              if (t.includes("sin documento")) {
+              if (aliases.some((alias) => t.includes(alias))) {
                 const label = (opt.label || opt.textContent || "").replace(/\s+/g, " ").trim();
                 return { value: opt.value, label };
               }
@@ -4775,7 +5587,7 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
         for (const sel of Array.from(document.querySelectorAll("select"))) {
           for (const opt of Array.from(sel.options)) {
             const t = normText(opt.label || opt.textContent || "");
-            if (t.includes("sin documento")) {
+            if (aliases.some((alias) => t.includes(alias))) {
               const label = (opt.label || opt.textContent || "").replace(/\s+/g, " ").trim();
               return { value: opt.value, label };
             }
@@ -4784,7 +5596,8 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
         return null;
       }
 
-      const pair = findSinDocumentoPair();
+      const aliases = targetAliases;
+      const pair = findTargetPair();
       if (!pair) {
         return { ok: false as const, reason: "sin-par-en-selects" };
       }
@@ -4817,18 +5630,52 @@ async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: S
         updatedHidden: Boolean(hidden),
         updatedTextbox: Boolean(textBox),
       };
-    })
+    }, aliasTargets)
     .catch(() => ({ ok: false as const, reason: "evaluate-error" }));
 
   if (!domFallback.ok) {
     throw new Error(
-      `No pude elegir «Sin documento»: el menú Dojo no respondió y el respaldo DOM falló (${"reason" in domFallback ? domFallback.reason : "desconocido"}). Hace falta un <select> en la página con la opción o input hidden name=tipoDocumento.`,
+      `No pude elegir «${targetLabel}»: el menú Dojo no respondió y el respaldo DOM falló (${"reason" in domFallback ? domFallback.reason : "desconocido"}). Hace falta un <select> en la página con la opción o input hidden name=tipoDocumento.`,
     );
   }
 
   await onStep?.(
     `SUNAT: respaldo DOM: input#inicio.tipoDocumento → «${domFallback.label}»; hidden name=tipoDocumento → value="${domFallback.code}".`,
   );
+}
+
+/** Tras el modal de inconsistencia: abre el desplegable y elige SIN DOCUMENTO (control id inicio.tipoDocumento, suele ser un input Dojo). */
+async function selectSunatInicioTipoDocumentoSinDocumento(page: Page, onStep?: StepReporter): Promise<void> {
+  await selectSunatInicioTipoDocumentoByLabel(page, "Sin documento", onStep);
+}
+
+async function readSunatInicioTipoDocumentoState(
+  page: Page,
+): Promise<{ visibleLabel: string; hiddenCode: string }> {
+  for (const scope of collectPageScopes(page)) {
+    const result = await scope
+      .locator("body")
+      .evaluate(() => {
+        const visibleInput = document.getElementById("inicio.tipoDocumento");
+        const hiddenInput = document.querySelector('input[type="hidden"][name="tipoDocumento"]');
+
+        const visibleLabel =
+          visibleInput instanceof HTMLInputElement
+            ? (visibleInput.value || "").trim()
+            : ((visibleInput?.textContent || "") ?? "").replace(/\s+/g, " ").trim();
+        const hiddenCode =
+          hiddenInput instanceof HTMLInputElement ? (hiddenInput.value || "").trim() : "";
+
+        return { visibleLabel, hiddenCode };
+      })
+      .catch(() => ({ visibleLabel: "", hiddenCode: "" }));
+
+    if (result.visibleLabel || result.hiddenCode) {
+      return result;
+    }
+  }
+
+  return { visibleLabel: "", hiddenCode: "" };
 }
 
 function describePageScopeForLog(scope: PageScope): string {
@@ -5054,48 +5901,13 @@ async function tryRecoverSunatInconsistentIdentityModal(
     return false;
   }
 
+  const rawDoc = (draft.customer.documentNumber || "").trim();
   await onStep?.(
-    "SUNAT: cierro el aviso (Aceptar), elijo Sin documento y escribo el nombre del cliente a mano.",
+    `SUNAT: detecté «documento de identidad inconsistente» para ${truncateForLog(rawDoc || "sin documento", 32)}; omitiré esta venta para no afectar el resto de la corrida.`,
   );
-
-  const closed = await tryClickSunatModalAceptar(page, dialogHit.scope, dialogHit.modalRoot, onStep);
-  if (!closed) {
-    throw new Error(
-      "SUNAT mostró documento de identidad inconsistente pero no pude cerrar el modal (botón Aceptar no encontrado o click falló). Revisa los pasos registrados arriba.",
-    );
-  }
-
-  await page.waitForTimeout(500);
-
-  const stillMessage = await dialogHit.scope
-    .getByText(SUNAT_INCONSISTENT_IDENTITY_MODAL_RE)
-    .first()
-    .isVisible()
-    .catch(() => false);
-  if (stillMessage) {
-    await onStep?.(
-      "SUNAT modal inconsistencia: el mensaje inconsistente sigue visible tras Aceptar; reintento cerrar el modal.",
-    );
-    const retryClosed = await tryClickSunatModalAceptar(page, dialogHit.scope, dialogHit.modalRoot, onStep);
-    await page.waitForTimeout(400);
-    const stillThere = await dialogHit.scope
-      .getByText(SUNAT_INCONSISTENT_IDENTITY_MODAL_RE)
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (stillThere || !retryClosed) {
-      throw new Error(
-        "SUNAT: el modal de documento inconsistente sigue abierto después de intentar Aceptar dos veces. Revisa los pasos registrados (visibilidad de #dlgBtnAceptar).",
-      );
-    }
-  } else {
-    await onStep?.("SUNAT modal inconsistencia: el aviso ya no está visible; continúo con tipo Sin documento.");
-  }
-
-  await page.waitForTimeout(1_000);
-  await prepareSunatCustomerWithoutDocument(page, profile, draft.customer.name, onStep);
-
-  return true;
+  throw new OmitSaleError(
+    `SUNAT rechazó el DNI ${rawDoc || "sin número"} por inconsistencia. Se omite esta venta y la corrida continúa con las demás.`,
+  );
 }
 
 async function prepareSunatCustomerWithoutDocument(
@@ -5105,7 +5917,7 @@ async function prepareSunatCustomerWithoutDocument(
   onStep?: StepReporter,
 ): Promise<{ scope: PageScope; locator: Locator }> {
   await selectSunatInicioTipoDocumentoSinDocumento(page, onStep);
-  await page.waitForTimeout(400);
+  await page.waitForTimeout(SUNAT_TIMING.postWithoutDocumentSelectionPauseMs);
 
   const nameSelectorsRecovery = uniqueSelectors([
     "#inicio\\.razonSocial",
@@ -5261,10 +6073,9 @@ async function waitForSunatProcessingToSettle(
   onStep?: StepReporter,
   timeoutMs = 20_000,
 ): Promise<void> {
-  const processingVisible = await tryWaitForAnyVisibleLocatorInPageTree(
+  const processingVisible = await waitForSunatProcessingToAppear(
     page,
-    sunatProcessingMarkers(),
-    4_000,
+    SUNAT_TIMING.processingMarkerAppearTimeoutMs,
   );
 
   if (!processingVisible) {
@@ -5273,7 +6084,7 @@ async function waitForSunatProcessingToSettle(
 
   await onStep?.(`SUNAT está procesando ${label}; esperaré con más calma.`);
   const deadline = Date.now() + timeoutMs;
-  let nextProgressLogAt = Date.now() + 5_000;
+  let nextProgressLogAt = Date.now() + SUNAT_TIMING.processingProgressLogMs;
 
   while (Date.now() < deadline) {
     const stillProcessing = await isAnyVisibleLocatorInPageTree(page, sunatProcessingMarkers());
@@ -5284,15 +6095,99 @@ async function waitForSunatProcessingToSettle(
 
     if (Date.now() >= nextProgressLogAt) {
       await onStep?.(`SUNAT sigue procesando ${label}; continúo esperando.`);
-      nextProgressLogAt = Date.now() + 5_000;
+      nextProgressLogAt = Date.now() + SUNAT_TIMING.processingProgressLogMs;
     }
 
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(SUNAT_TIMING.processingPollMs);
   }
 
   await onStep?.(
     `SUNAT sigue procesando ${label} después de ${Math.round(timeoutMs / 1_000)}s; revisaré si la pantalla cambió igual.`,
   );
+}
+
+async function waitForSunatProcessingToAppear(page: Page, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (await isAnyVisibleLocatorInPageTree(page, sunatProcessingMarkers())) {
+      return true;
+    }
+
+    await page.waitForTimeout(SUNAT_TIMING.processingMarkerAppearPollMs);
+  }
+
+  return false;
+}
+
+async function clickSunatAction(
+  page: Page,
+  locator: Locator,
+  onStep: StepReporter | undefined,
+  label: string,
+  options?: {
+    skipGenericDialogDismiss?: boolean;
+  },
+): Promise<void> {
+  await dismissSunatContactValidationSurface(page, onStep);
+  if (!options?.skipGenericDialogDismiss) {
+    await tryDismissGenericSunatDialog(page, onStep);
+  }
+  await locator.scrollIntoViewIfNeeded().catch(() => undefined);
+
+  try {
+    await locator.click({ timeout: 8_000 });
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    const blockedByOverlay =
+      /intercepts pointer events|dijitDialogUnderlay|dlgMensaje_underlay|divModalCampana|ifrVCE/i.test(message);
+    if (!blockedByOverlay) {
+      throw error;
+    }
+
+    await onStep?.(`SUNAT: un overlay bloqueó el click en ${label}; intentaré limpiarlo y reintentar.`);
+    await dismissSunatContactValidationSurface(page, onStep);
+    if (!options?.skipGenericDialogDismiss) {
+      await tryDismissGenericSunatDialog(page, onStep);
+    }
+    await locator.waitFor({ state: "visible", timeout: 3_000 }).catch(() => undefined);
+    await locator.scrollIntoViewIfNeeded().catch(() => undefined);
+    await locator.click({ timeout: 8_000 }).catch(async () => {
+      await locator.click({ force: true, timeout: 8_000 });
+    });
+  }
+}
+
+async function tryDismissGenericSunatDialog(page: Page, onStep?: StepReporter): Promise<void> {
+  const overlayVisible = await isAnyVisibleLocatorInPageTree(page, [
+    "#dlgMensaje_underlay",
+    ".dijitDialogUnderlay",
+    ".dijitDialogUnderlayWrapper",
+  ]).catch(() => false);
+
+  if (!overlayVisible) {
+    return;
+  }
+
+  const acceptSelectors = [
+    "#dlgBtnAceptarConfirm_label",
+    "#dlgBtnAceptar_label",
+    "#dlgBtnAceptar",
+    "xpath=//span[contains(@class,'dijitButtonText') and contains(normalize-space(.), 'Aceptar')]",
+    "xpath=//button[contains(normalize-space(.), 'Aceptar')]",
+    "xpath=//input[contains(@value, 'Aceptar')]",
+  ];
+
+  const acceptButton = await tryWaitForAnyVisibleLocatorInPageTree(page, acceptSelectors, 750);
+  if (!acceptButton) {
+    return;
+  }
+
+  await onStep?.("SUNAT: encontré un diálogo bloqueante; haré click en Aceptar para liberar el flujo.");
+  await acceptButton.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  await acceptButton.locator.click({ force: true }).catch(() => undefined);
+  await page.waitForTimeout(200).catch(() => undefined);
 }
 
 function truncateForLog(value: string, maxLength: number): string {
@@ -5391,6 +6286,268 @@ async function downloadSunatReceiptFiles(
   }
 
   return downloadedFiles;
+}
+
+async function closeSunatSuccessSurface(
+  page: Page,
+  profile: SiteProfile,
+  onStep?: StepReporter,
+): Promise<boolean> {
+  const closeSelectors = uniqueSelectors([
+    profile.sunat.closeSuccessSelector ?? "",
+    "xpath=//input[contains(@value,'Cerrar')]",
+    "xpath=//button[contains(normalize-space(.),'Cerrar')]",
+    "text=Cerrar",
+  ]);
+
+  const closeButton = await tryWaitForAnyVisibleLocatorInPageTree(page, closeSelectors, 5_000);
+  if (!closeButton) {
+    await onStep?.("SUNAT: no encontré el botón Cerrar en la pantalla final; abriré una pestaña nueva en la siguiente venta.");
+    return false;
+  }
+
+  await onStep?.(`SUNAT: boleta descargada; haré click en Cerrar (${await describeLocatorIdentity(closeButton.locator)}).`);
+  await clickSunatAction(page, closeButton.locator, onStep, "Cerrar boleta emitida");
+  await waitForSunatProcessingToSettle(page, "el cierre de la boleta emitida", onStep, 8_000).catch(() => undefined);
+  const acceptedRepeatBoleta = await waitForSunatRepeatBoletaDialogAndAccept(page, profile, onStep, 15_000);
+  if (acceptedRepeatBoleta) {
+    await waitForSunatProcessingToSettle(
+      page,
+      "la confirmación para emitir otra boleta",
+      onStep,
+      8_000,
+    ).catch(() => undefined);
+  } else {
+    await onStep?.(
+      "SUNAT: no pude resolver el diálogo Aceptar tras Cerrar; verificaré igual si el formulario quedó listo para reutilizarse.",
+    );
+  }
+
+  const resumedWorkflow = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    [
+      ...customerDocumentSelectors(profile.sunat.customerDocumentSelector),
+      ...customerNameSelectors(profile.sunat.customerNameSelector),
+      ...customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar"),
+      ...addItemButtonSelectors(profile.sunat.addItemButtonSelector),
+    ].filter(Boolean),
+    15_000,
+  );
+
+  if (!resumedWorkflow) {
+    await onStep?.("SUNAT: hice click en Cerrar, pero no confirmé la vuelta al formulario; en la siguiente venta abriré una pestaña nueva.");
+    return false;
+  }
+
+  await onStep?.(`SUNAT: la pantalla quedó lista para reutilizarse (${await describeLocatorIdentity(resumedWorkflow.locator)}).`);
+  return true;
+}
+
+async function tryClickSunatRepeatBoletaAcceptFromDialog(
+  page: Page,
+  onStep?: StepReporter,
+): Promise<boolean> {
+  const dialogTextLooksLikeRepeatPrompt = (raw: string): boolean => {
+    const normalized = raw
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+
+    return (
+      normalized.includes("desea emitir otra boleta de venta") ||
+      normalized.includes("debe haber otorgado la boleta de venta") ||
+      normalized.includes("confirmar")
+    );
+  };
+
+  for (const scope of collectPageScopes(page)) {
+    const dialogs = scope.locator(".dijitDialog");
+    const dialogCount = await dialogs.count().catch(() => 0);
+
+    for (let dialogIndex = 0; dialogIndex < Math.min(dialogCount, 10); dialogIndex += 1) {
+      const dialog = dialogs.nth(dialogIndex);
+      if (!(await dialog.isVisible().catch(() => false))) {
+        continue;
+      }
+
+      const dialogText = ((await dialog.textContent().catch(() => "")) ?? "").trim();
+      if (!dialogTextLooksLikeRepeatPrompt(dialogText)) {
+        continue;
+      }
+
+      const acceptCandidates = [
+        "#dlgBtnAceptarConfirm_label",
+        "#dlgBtnAceptarConfirm",
+        "#dlgBtnAceptar_label",
+        "#dlgBtnAceptar",
+        ".dijitButtonText",
+        "button",
+        "input[type='button']",
+        "input[type='submit']",
+        "[role='button']",
+      ];
+
+      for (const selector of acceptCandidates) {
+        const candidates = dialog.locator(selector);
+        const count = await candidates.count().catch(() => 0);
+
+        for (let index = 0; index < Math.min(count, 20); index += 1) {
+          const candidate = candidates.nth(index);
+          if (!(await candidate.isVisible().catch(() => false))) {
+            continue;
+          }
+
+          const text = (((await candidate.textContent().catch(() => "")) ?? "") || "").replace(/\s+/g, " ").trim();
+          const value = ((await candidate.getAttribute("value").catch(() => "")) ?? "").replace(/\s+/g, " ").trim();
+          const joined = `${text} ${value}`.trim().toLowerCase();
+          if (!joined.includes("aceptar")) {
+            continue;
+          }
+
+          try {
+            await candidate.scrollIntoViewIfNeeded().catch(() => undefined);
+            await candidate.click({ timeout: 2_000 }).catch(async () => {
+              await candidate.click({ force: true, timeout: 2_000 });
+            });
+            await onStep?.("SUNAT: hice click en Aceptar dentro del diálogo de Confirmar.");
+            await page.waitForTimeout(250).catch(() => undefined);
+            return true;
+          } catch {
+            const clickedViaDom = await candidate
+              .evaluate((element) => {
+                const target =
+                  element.closest("button, a, [role='button'], .dijitButton, .dijitButtonNode") ?? element;
+                if (!(target instanceof HTMLElement)) {
+                  return false;
+                }
+                target.click();
+                target.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+                return true;
+              })
+              .catch(() => false);
+
+            if (clickedViaDom) {
+              await onStep?.("SUNAT: hice click DOM en Aceptar dentro del diálogo de Confirmar.");
+              await page.waitForTimeout(250).catch(() => undefined);
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const pressedEnter = await page.keyboard
+    .press("Enter")
+    .then(() => true)
+    .catch(() => false);
+
+  if (pressedEnter) {
+    await onStep?.("SUNAT: no pude clicar Aceptar por selector/DOM; envié Enter para confirmar el diálogo.");
+    await page.waitForTimeout(250).catch(() => undefined);
+    return true;
+  }
+
+  return false;
+}
+
+async function waitForSunatRepeatBoletaDialogAndAccept(
+  page: Page,
+  profile: SiteProfile,
+  onStep?: StepReporter,
+  timeoutMs = 15_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  let dialogSeen = false;
+  let attemptedImmediateKeyboardConfirm = false;
+
+  while (Date.now() < deadline) {
+    if (!attemptedImmediateKeyboardConfirm) {
+      attemptedImmediateKeyboardConfirm = true;
+      const enterConfirmed = await page.keyboard
+        .press("Enter")
+        .then(() => true)
+        .catch(() => false);
+      if (enterConfirmed) {
+        await onStep?.(
+          "SUNAT: tras Cerrar, probé confirmar de inmediato con Enter por si el foco ya estaba en Aceptar.",
+        );
+        await page.waitForTimeout(500).catch(() => undefined);
+        const resumedAfterEnter = await tryWaitForAnyVisibleLocatorInPageTree(
+          page,
+          [
+            ...customerDocumentSelectors(profile.sunat.customerDocumentSelector),
+            ...customerNameSelectors(profile.sunat.customerNameSelector),
+            ...customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar"),
+            ...addItemButtonSelectors(profile.sunat.addItemButtonSelector),
+          ].filter(Boolean),
+          2_000,
+        );
+        if (resumedAfterEnter) {
+          await onStep?.(
+            `SUNAT: el formulario volvió tras Enter (${await describeLocatorIdentity(resumedAfterEnter.locator)}).`,
+          );
+          return true;
+        }
+      }
+    }
+
+    const dialog = await tryWaitForAnyVisibleLocatorInPageTree(
+      page,
+      [
+        "text=Desea emitir otra Boleta de Venta",
+        "text=Debe haber otorgado la Boleta de Venta",
+        "text=Confirmar",
+      ],
+      500,
+    );
+
+    if (dialog && !dialogSeen) {
+      dialogSeen = true;
+      await onStep?.(
+        `SUNAT: apareció el diálogo posterior a Cerrar (${await describeLocatorIdentity(dialog.locator)}); intentaré confirmar con Aceptar.`,
+      );
+      const enterConfirmed = await page.keyboard
+        .press("Enter")
+        .then(() => true)
+        .catch(() => false);
+      if (enterConfirmed) {
+        await onStep?.("SUNAT: el diálogo ya estaba visible; envié Enter para confirmar Aceptar.");
+        await page.waitForTimeout(500).catch(() => undefined);
+      }
+    }
+
+    const acceptButton = await tryWaitForAnyVisibleLocatorInPageTree(
+      page,
+      confirmAcceptSelectors(profile.sunat.confirmAcceptSelector),
+      500,
+    );
+    if (acceptButton) {
+      await onStep?.(
+        `SUNAT: apareció la confirmación para emitir otra boleta (${await describeLocatorIdentity(acceptButton.locator)}); haré click en Aceptar.`,
+      );
+      try {
+        await clickSunatAction(page, acceptButton.locator, onStep, "Aceptar tras cerrar boleta", {
+          skipGenericDialogDismiss: true,
+        });
+        return true;
+      } catch (error) {
+        await onStep?.(
+          `SUNAT: falló el click Playwright en Aceptar tras Cerrar (${error instanceof Error ? error.message : String(error)}); probaré un click directo dentro del diálogo.`,
+        );
+      }
+    }
+
+    if (await tryClickSunatRepeatBoletaAcceptFromDialog(page, onStep)) {
+      return true;
+    }
+
+    await page.waitForTimeout(250).catch(() => undefined);
+  }
+
+  return false;
 }
 
 export function extractSunatReceiptPrefix(receiptNumber?: string): string | undefined {
@@ -5507,27 +6664,25 @@ async function continueSunatBoletaWizard(
   page: Page,
   profile: SiteProfile,
   onStep?: StepReporter,
+  options?: {
+    allowImmediateFinalStage?: boolean;
+  },
 ): Promise<void> {
-  if (profile.sunat.finalSubmitSelector) {
-    const submitReady = await tryWaitForVisibleLocatorInPageTree(
+  if (options?.allowImmediateFinalStage) {
+    const finalReady = await tryWaitForAnyVisibleLocatorInPageTree(
       page,
-      profile.sunat.finalSubmitSelector,
+      [
+        ...preliminarySunatStepMarkers(),
+        ...finalSubmitSelectors(profile.sunat.finalSubmitSelector),
+      ],
       2_000,
     );
-    if (submitReady) {
-      await onStep?.("SUNAT ya está en la etapa final de envío.");
+    if (finalReady) {
+      await onStep?.(
+        `SUNAT ya está en la etapa final (${await describeLocatorIdentity(finalReady.locator)}); no buscaré otro Continuar.`,
+      );
       return;
     }
-  }
-
-  const preliminaryMarker = await tryWaitForAnyVisibleLocatorInPageTree(
-    page,
-    preliminarySunatStepMarkers(),
-    2_000,
-  );
-  if (preliminaryMarker) {
-    await onStep?.("SUNAT ya mostró la preliminar de la boleta.");
-    return;
   }
 
   await onStep?.("Buscando el botón Continuar de la boleta.");
@@ -5555,6 +6710,7 @@ async function continueSunatBoletaWizard(
 
   if (!optionalMarker) {
     await resolveAdditionalSunatTransportStep(page, profile, onStep);
+    await ensureSunatAdvancedPastCustomerScreen(page, profile, onStep, "el primer Continuar");
     return;
   }
 
@@ -5569,13 +6725,85 @@ async function continueSunatBoletaWizard(
     page,
     [
       ...preliminarySunatStepMarkers(),
-      profile.sunat.finalSubmitSelector ?? "",
+      ...finalSubmitSelectors(profile.sunat.finalSubmitSelector),
       ...additionalSunatTransportStepMarkers(),
     ].filter(Boolean),
     25_000,
   );
 
   await resolveAdditionalSunatTransportStep(page, profile, onStep);
+  await ensureSunatAdvancedPastCustomerScreen(page, profile, onStep, "la pantalla opcional");
+}
+
+async function ensureSunatAdvancedPastCustomerScreen(
+  page: Page,
+  profile: SiteProfile,
+  onStep?: StepReporter,
+  contextLabel = "Continuar",
+): Promise<void> {
+  const targetSelectors = [
+    ...preliminarySunatStepMarkers(),
+    ...finalSubmitSelectors(profile.sunat.finalSubmitSelector),
+    ...additionalSunatTransportStepMarkers(),
+  ].filter(Boolean);
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const targetSurface = await tryWaitForAnyVisibleLocatorInPageTree(page, targetSelectors, 8_000);
+    if (targetSurface) {
+      await onStep?.(
+        `SUNAT avanzó después de ${contextLabel} (${await describeLocatorIdentity(targetSurface.locator)}).`,
+      );
+      return;
+    }
+
+    const stillOnCustomer = await isSunatCustomerQuestionnaireSurface(page, profile);
+    if (!stillOnCustomer) {
+      break;
+    }
+
+    if (attempt === 2) {
+      break;
+    }
+
+    await onStep?.(
+      `SUNAT siguió en la pantalla inicial del cliente tras ${contextLabel}; haré un Continuar adicional para retomar el flujo.`,
+    );
+    const continueButton = await tryWaitForBottomMostVisibleLocatorInPageTree(
+      page,
+      customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar"),
+      5_000,
+    );
+    if (!continueButton) {
+      break;
+    }
+
+    await clickSunatAction(page, continueButton.locator, onStep, `Continuar extra tras ${contextLabel}`);
+    await waitForSunatProcessingToSettle(page, `${contextLabel} (reintento)`, onStep, 20_000);
+    await dismissSunatContactValidationSurface(page, onStep);
+  }
+
+  await waitForAnyVisibleLocatorInPageTree(page, targetSelectors, 5_000);
+}
+
+async function isSunatCustomerQuestionnaireSurface(page: Page, profile: SiteProfile): Promise<boolean> {
+  const hasContinue = await isAnyVisibleLocatorInPageTree(
+    page,
+    customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar"),
+  ).catch(() => false);
+  if (!hasContinue) {
+    return false;
+  }
+
+  const hasCustomerFields = await isAnyVisibleLocatorInPageTree(
+    page,
+    [
+      ...customerDocumentTypeSelectors(profile.sunat.customerDocumentTypeSelector ?? "#inicio\\.tipoDocumento"),
+      ...customerDocumentSelectors(profile.sunat.customerDocumentSelector),
+      ...customerNameSelectors(profile.sunat.customerNameSelector),
+    ].filter(Boolean),
+  ).catch(() => false);
+
+  return hasCustomerFields;
 }
 
 function optionalSunatStepMarkers(): string[] {
@@ -5671,7 +6899,6 @@ function sunatProcessingMarkers(): string[] {
     "#waitMessage",
     "text=Procesando...",
     "text=Procesando",
-    ".dijitDialogUnderlay",
   ]);
 }
 
@@ -5679,8 +6906,112 @@ function preliminarySunatStepMarkers(): string[] {
   return uniqueSelectors([
     "text=PRELIMINAR DE BOLETA DE VENTA ELECTRÓNICA",
     "text=PRELIMINAR DE BOLETA DE VENTA ELECTRONICA",
-    "text=Señor(es)",
   ]);
+}
+
+function finalSubmitSelectors(primarySelector?: string): string[] {
+  return uniqueSelectors([
+    primarySelector ?? "",
+    "#boleta-preliminar\\.botonGrabarDocumento",
+    "#boleta-preliminar\\.botonGrabarDocumento_label",
+    "xpath=//*[@id='boleta-preliminar.botonGrabarDocumento_label']",
+    "xpath=//*[@id='boleta-preliminar.botonGrabarDocumento_label']/ancestor::*[@id='boleta-preliminar.botonGrabarDocumento'][1]",
+    "xpath=//*[@id='boleta-preliminar.botonGrabarDocumento']",
+  ]);
+}
+
+function confirmAcceptSelectors(primarySelector?: string): string[] {
+  return uniqueSelectors([
+    primarySelector ?? "",
+    "#dlgBtnAceptarConfirm_label",
+    "#dlgBtnAceptarConfirm",
+    "#dlgBtnAceptar_label",
+    "#dlgBtnAceptar",
+    "text=Aceptar",
+    "xpath=//div[contains(@class,'dijitDialog')][.//*[contains(normalize-space(.), 'Desea emitir otra Boleta de Venta')]]//*[self::span or self::button or self::input][contains(normalize-space(.), 'Aceptar') or contains(@value, 'Aceptar')]",
+    "xpath=//div[contains(@class,'dijitDialog')][.//*[contains(normalize-space(.), 'Debe haber otorgado la Boleta de Venta')]]//*[self::span or self::button or self::input][contains(normalize-space(.), 'Aceptar') or contains(@value, 'Aceptar')]",
+    "xpath=//span[contains(@class,'dijitButtonText') and contains(normalize-space(.), 'Aceptar')]",
+    "xpath=//button[contains(normalize-space(.), 'Aceptar')]",
+    "xpath=//input[contains(@value, 'Aceptar')]",
+  ]);
+}
+
+function sunatFinalSurfaceSelectors(profile: SiteProfile): string[] {
+  return uniqueSelectors([
+    profile.sunat.successSelector ?? "",
+    profile.sunat.receiptNumberSelector ?? "",
+    profile.sunat.pdfDownloadSelector ?? "",
+    profile.sunat.xmlDownloadSelector ?? "",
+    "#numeroComprobante",
+    "#dijit_form_Button_2_label",
+  ]);
+}
+
+async function resolveSunatPostEmitTransition(
+  page: Page,
+  profile: SiteProfile,
+  onStep?: StepReporter,
+): Promise<void> {
+  const startedAt = Date.now();
+  let resumedUnexpectedSurface = false;
+
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+
+  while (Date.now() - startedAt < 15_000) {
+    const successSurface = await tryWaitForAnyVisibleLocatorInPageTree(
+      page,
+      sunatFinalSurfaceSelectors(profile),
+      750,
+    );
+    if (successSurface) {
+      await onStep?.(`SUNAT ya mostró la pantalla final (${await describeLocatorIdentity(successSurface.locator)}).`);
+      return;
+    }
+
+    const confirmButton = await tryWaitForAnyVisibleLocatorInPageTree(
+      page,
+      confirmAcceptSelectors(profile.sunat.confirmAcceptSelector),
+      750,
+    );
+    if (confirmButton) {
+      await onStep?.(`Botón Aceptar encontrado (${await describeLocatorIdentity(confirmButton.locator)}); haré click.`);
+      await clickSunatAction(page, confirmButton.locator, onStep, "Aceptar confirmación", {
+        skipGenericDialogDismiss: true,
+      });
+      await onStep?.("Click en Aceptar realizado; esperando el comprobante emitido.");
+      await waitForSunatProcessingToSettle(page, "la confirmación de emisión", onStep, 8_000);
+      await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+      continue;
+    }
+
+    if (!resumedUnexpectedSurface) {
+      const backOnQuestionnaire =
+        (await isAnyVisibleLocatorInPageTree(page, customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar")).catch(() => false)) &&
+        (await isAnyVisibleLocatorInPageTree(page, [
+          profile.sunat.customerDocumentTypeSelector ?? "",
+          profile.sunat.customerDocumentSelector ?? "",
+          profile.sunat.customerNameSelector ?? "",
+        ].filter(Boolean)).catch(() => false));
+
+      if (backOnQuestionnaire) {
+        resumedUnexpectedSurface = true;
+        await onStep?.("SUNAT volvió a una pantalla intermedia tras Emitir; intentaré retomar el flujo una sola vez.");
+        await continueSunatBoletaWizard(page, profile, onStep);
+        const submitButton = await waitForAnyVisibleLocatorInPageTree(
+          page,
+          finalSubmitSelectors(profile.sunat.finalSubmitSelector),
+          15_000,
+        );
+        await onStep?.(`Retomé la etapa final y encontré Emitir (${await describeLocatorIdentity(submitButton.locator)}).`);
+        await clickSunatAction(page, submitButton.locator, onStep, "Emitir tras retomar flujo");
+        await waitForSunatProcessingToSettle(page, "la emisión reintentada", onStep, 20_000);
+        await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+        continue;
+      }
+    }
+
+    await page.waitForTimeout(300).catch(() => undefined);
+  }
 }
 
 async function addItemsViaSunatModal(
@@ -5688,7 +7019,9 @@ async function addItemsViaSunatModal(
   preferredScope: PageScope,
   draft: InvoiceDraft,
   profile: SiteProfile,
+  config: AppConfig,
   onStep: StepReporter,
+  validationWatcher?: SunatValidationWatcherController,
 ): Promise<void> {
   const itemDialogSelector = profile.sunat.itemDialogSelector;
   const itemAcceptSelector = profile.sunat.itemAcceptSelector;
@@ -5698,12 +7031,24 @@ async function addItemsViaSunatModal(
   }
 
   const existingRowCount = await countVisibleItemRows(preferredScope, profile.sunat.itemRowSelector);
+  validationWatcher?.pause("item-dialog");
+  try {
+    for (let index = 0; index < draft.items.length; index += 1) {
+      const item = draft.items[index];
+      const sanitizedDescription = sanitizeSunatItemDescription(item.description);
+      await onStep(`Agregando item ${index + 1} de ${draft.items.length} en SUNAT`);
+      await onStep(`Buscando el botón Adicionar para el item ${index + 1}.`);
 
-  for (let index = 0; index < draft.items.length; index += 1) {
-    const item = draft.items[index];
-    const sanitizedDescription = sanitizeSunatItemDescription(item.description);
-    await onStep(`Agregando item ${index + 1} de ${draft.items.length} en SUNAT`);
-    await onStep(`Buscando el botón Adicionar para el item ${index + 1}.`);
+      const addButton = await waitForSunatAddItemButtonWithRecovery(
+        page,
+        preferredScope,
+        profile,
+        config,
+        onStep,
+        index,
+      );
+      await onStep(`Botón Adicionar encontrado; abriendo el modal del item ${index + 1}.`);
+      await clickSunatAction(page, addButton.locator, onStep, `Adicionar item ${index + 1}`);
 
     const addButton = await waitForAnyVisibleLocatorInPageTree(
       page,
@@ -5722,7 +7067,13 @@ async function addItemsViaSunatModal(
     );
     await onStep(`Modal del item ${index + 1} abierto; completaré los campos.`);
 
-    await selectSunatItemKindAsGood(page, dialog.scope);
+      const quantityField = await waitForAnyVisibleLocatorWithinRoot(
+        dialog.locator,
+        itemQuantitySelectors(profile.sunat.itemQuantitySelector),
+        30_000,
+      );
+      await quantityField.fill(String(item.quantity));
+      await onStep(`Cantidad del item ${index + 1} registrada: ${item.quantity}.`);
 
     const quantityField = await waitForAnyVisibleLocatorInPageTree(
       page,
@@ -5733,17 +7084,63 @@ async function addItemsViaSunatModal(
     await quantityField.locator.fill(String(item.quantity));
     await onStep(`Cantidad del item ${index + 1} registrada: ${item.quantity}.`);
 
-    if (profile.sunat.itemUnitMeasureSelector) {
-      const unitMeasureField = await tryWaitForAnyVisibleLocatorInPageTree(
+      await selectSunatTaxCategory(page, dialog.scope, profile, draft);
+
+      const unitPriceValue = formatSunatCurrency(calculateSunatUnitPrice(item, draft));
+      const unitPriceField = await waitForAnyVisibleLocatorWithinRoot(
+        dialog.locator,
+        itemUnitPriceSelectors(profile.sunat.itemUnitPriceSelector),
+        30_000,
+      );
+      await typeIntoSunatCurrencyField(page, unitPriceField, unitPriceValue);
+      await onStep(`Precio del item ${index + 1} registrado: ${unitPriceValue}.`);
+      await triggerSunatItemAmountUpdate(page);
+      await onStep(`Esperando que SUNAT calcule los montos del item ${index + 1}.`);
+      await waitForSunatItemAmountPreview(page, dialog.scope);
+
+      await onStep(`Buscando el botón Aceptar del item ${index + 1}.`);
+      const targetRowCount = existingRowCount + index + 1;
+      const dialogSelectorList = itemDialogSelectors(itemDialogSelector);
+      await clickSunatItemAcceptAction(
         page,
         itemUnitMeasureSelectors(profile.sunat.itemUnitMeasureSelector),
         2_500,
         dialog.scope,
+        dialogSelectorList,
+        profile.sunat.itemRowSelector,
+        targetRowCount,
+        itemAcceptSelectors(itemAcceptSelector),
+        onStep,
+        `Aceptar item ${index + 1}`,
       );
-      if (unitMeasureField) {
-        await setSunatUnitMeasure(unitMeasureField.locator, item.description);
+      await onStep(`SUNAT aceptó el item ${index + 1} y espero que se cierre el modal.`);
+
+      await waitForSunatItemAcceptance(
+        page,
+        preferredScope,
+        dialogSelectorList,
+        profile.sunat.itemRowSelector,
+        targetRowCount,
+        30_000,
+        dialog.scope,
+      );
+      await onStep(`El modal del item ${index + 1} ya se cerró en SUNAT.`);
+
+      if (profile.sunat.itemRowSelector) {
+        await waitForMinimumItemRows(
+          preferredScope,
+          profile.sunat.itemRowSelector,
+          existingRowCount + index + 1,
+          1_500,
+        )
+          .then(() => onStep(`El item ${index + 1} ya aparece en la grilla principal de SUNAT.`))
+          .catch(() => onStep(`No pude confirmar por conteo la grilla del item ${index + 1}; igual continuaré.`));
       }
     }
+  } finally {
+    validationWatcher?.resume();
+  }
+}
 
     const descriptionField = await waitForAnyVisibleLocatorInPageTree(
       page,
@@ -5754,32 +7151,91 @@ async function addItemsViaSunatModal(
     await descriptionField.locator.fill(sanitizedDescription);
     await onStep(`Descripción del item ${index + 1} registrada.`);
 
-    await selectSunatTaxCategory(page, dialog.scope, profile, draft);
+  const customerSurfaceVisible = await isAnyVisibleLocatorInPageTree(
+    page,
+    [
+      ...customerDocumentSelectors(profile.sunat.customerDocumentSelector),
+      ...customerNameSelectors(profile.sunat.customerNameSelector),
+      ...customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar"),
+    ].filter(Boolean),
+    preferredScope,
+  ).catch(() => false);
 
-    const unitPriceValue = formatSunatCurrency(calculateSunatUnitPrice(item, draft));
-    const unitPriceField = await waitForAnyVisibleLocatorInPageTree(
+  if (customerSurfaceVisible) {
+    const continueButton = await tryWaitForBottomMostVisibleLocatorInPageTree(
       page,
       itemUnitPriceSelectors(profile.sunat.itemUnitPriceSelector),
       8_000,
       dialog.scope,
     );
-    await typeIntoSunatCurrencyField(page, unitPriceField.locator, unitPriceValue);
-    await onStep(`Precio del item ${index + 1} registrado: ${unitPriceValue}.`);
-    await triggerSunatItemAmountUpdate(page);
-    await onStep(`Esperando que SUNAT calcule los montos del item ${index + 1}.`);
-    await waitForSunatItemAmountPreview(page, dialog.scope);
+    if (continueButton) {
+      await onStep?.(
+        `SUNAT seguía en la pantalla del cliente antes del item ${itemIndex + 1}; haré un Continuar adicional para llegar a los ítems.`,
+      );
+      await clickSunatAction(page, continueButton.locator, onStep, `Continuar previo al item ${itemIndex + 1}`);
+      await waitForSunatProcessingToSettle(
+        page,
+        `el ingreso a la pantalla de ítems del item ${itemIndex + 1}`,
+        onStep,
+        20_000,
+      );
+      await dismissSunatContactValidationSurface(page, onStep);
+    }
+  }
 
-    await onStep(`Buscando el botón Aceptar del item ${index + 1}.`);
-    const acceptButton = await waitForAnyVisibleLocatorInPageTree(
+  const addButtonAfterCustomerRecovery = await tryWaitForAnyVisibleLocatorInPageTree(
+    page,
+    addSelectors,
+    3_000,
+    preferredScope,
+  );
+  if (addButtonAfterCustomerRecovery) {
+    return addButtonAfterCustomerRecovery;
+  }
+
+  const menuSearchVisible = await isAnyVisibleLocatorInPageTree(
+    page,
+    ["#txtBusca"],
+    preferredScope,
+  ).catch(() => false);
+
+  if (menuSearchVisible && profile.sunat.postLoginMenuLabels?.length) {
+    await onStep?.(
+      `SUNAT volvió al menú antes del item ${itemIndex + 1}; reabriré «Emitir Boleta de Venta» antes de seguir.`,
+    );
+    await navigateSunatSolMenu(
       page,
       itemAcceptSelectors(itemAcceptSelector),
       8_000,
       dialog.scope,
     );
-    await acceptButton.locator.click();
-    await onStep(`SUNAT aceptó el item ${index + 1} y espero que se cierre el modal.`);
+    await dismissSunatContactValidationSurface(page, onStep);
+  }
 
-    await waitForSunatItemAcceptance(
+  return waitForAnyVisibleLocatorInPageTree(page, addSelectors, 30_000, preferredScope);
+}
+
+async function clickSunatItemAcceptAction(
+  page: Page,
+  gridScope: PageScope,
+  dialogScope: PageScope,
+  dialogSelectors: string[],
+  rowSelector: string | undefined,
+  minimumRowCount: number,
+  selectors: string[],
+  onStep: StepReporter | undefined,
+  label: string,
+): Promise<void> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (await hasSunatItemAcceptanceSucceeded(page, gridScope, dialogSelectors, rowSelector, minimumRowCount, dialogScope)) {
+      await onStep?.(`SUNAT ya había aplicado ${label}; continuaré sin volver a buscar el botón.`);
+      return;
+    }
+
+    await tryDismissGenericSunatDialog(page, onStep);
+    await waitForSunatProcessingToSettle(
       page,
       preferredScope,
       itemDialogSelectors(itemDialogSelector),
@@ -5797,10 +7253,15 @@ async function addItemsViaSunatModal(
         existingRowCount + index + 1,
         1_000,
       )
-        .then(() => onStep(`El item ${index + 1} ya aparece en la grilla principal de SUNAT.`))
-        .catch(() => onStep(`No pude confirmar por conteo la grilla del item ${index + 1}; igual continuaré.`));
+    ) {
+      return true;
     }
+
+    await tryDismissGenericSunatDialog(page).catch(() => undefined);
+    await page.waitForTimeout(250).catch(() => undefined);
   }
+
+  return false;
 }
 
 export function addItemButtonSelectors(primarySelector?: string): string[] {
@@ -5830,6 +7291,9 @@ function itemAcceptSelectors(primarySelector: string): string[] {
   return uniqueSelectors([
     primarySelector,
     "#item\\.botonAceptar",
+    "#item\\.botonAceptar_label",
+    "xpath=//*[@id='item.botonAceptar_label']/ancestor::*[@id='item.botonAceptar'][1]",
+    "xpath=//*[@id='item.botonAceptar' and @role='button']",
     "text=Aceptar",
     "xpath=//*[@id='item.botonAceptar']",
     "xpath=//input[contains(@value, 'Aceptar')]",
@@ -5842,7 +7306,6 @@ function itemQuantitySelectors(primarySelector: string): string[] {
     primarySelector,
     "#item\\.cantidad",
     "xpath=//*[@id='item.cantidad']",
-    "xpath=//*[contains(normalize-space(.), 'Cantidad')]/following::input[not(@type='hidden') and not(@readonly) and not(@aria-hidden='true')][1]",
   ]);
 }
 
@@ -5851,7 +7314,6 @@ function itemDescriptionSelectors(primarySelector: string): string[] {
     primarySelector,
     "#item\\.descripcion",
     "xpath=//*[@id='item.descripcion']",
-    "xpath=//*[contains(normalize-space(.), 'Descripción') or contains(normalize-space(.), 'Descripcion')]/following::textarea[1]",
   ]);
 }
 
@@ -5861,7 +7323,6 @@ function itemUnitPriceSelectors(primarySelector: string): string[] {
     "#item\\.precioUnitario",
     "xpath=//*[@id='item.precioUnitario']",
     "xpath=//*[@id='item.valorUnitario']",
-    "xpath=//*[contains(normalize-space(.), 'Valor Unitario')]/following::input[not(@type='hidden') and not(@readonly) and not(@aria-hidden='true')][1]",
   ]);
 }
 
@@ -5943,7 +7404,7 @@ async function waitForItemDialogToClose(
     if (!dialog) {
       return;
     }
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(SUNAT_TIMING.itemDialogPollMs);
   }
 
   throw new Error("El modal de SUNAT para agregar ítems no se cerró después de aceptar.");
@@ -5972,7 +7433,7 @@ async function waitForSunatItemAcceptance(
     if (!dialog) {
       return;
     }
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(SUNAT_TIMING.itemDialogPollMs);
   }
 
   await waitForItemDialogToClose(page, dialogSelectors, 1_000, dialogScope);
@@ -6012,9 +7473,9 @@ async function waitForMinimumItemRows(
       return;
     }
     if ("page" in scope) {
-      await scope.page().waitForTimeout(250).catch(() => undefined);
+      await scope.page().waitForTimeout(SUNAT_TIMING.itemGridPollMs).catch(() => undefined);
     } else {
-      await scope.waitForTimeout(250).catch(() => undefined);
+      await scope.waitForTimeout(SUNAT_TIMING.itemGridPollMs).catch(() => undefined);
     }
   }
 
@@ -6130,8 +7591,50 @@ async function typeIntoSunatCurrencyField(page: Page, locator: Locator, value: s
   });
   await page.keyboard.press("Meta+A").catch(() => undefined);
   await page.keyboard.press("Backspace").catch(() => undefined);
-  await locator.pressSequentially(value, { delay: 80 });
+  await locator.pressSequentially(value, { delay: SUNAT_TIMING.currencyTypingDelayMs });
   await locator.blur();
+}
+
+async function fillSunatCustomerDocumentFieldExact(
+  page: Page,
+  locator: Locator,
+  expectedValue: string,
+): Promise<string> {
+  await locator.click().catch(() => undefined);
+  await locator.fill("").catch(() => undefined);
+  await locator.fill(expectedValue).catch(() => undefined);
+
+  let currentValue = await readLocatorValue(locator);
+  if (currentValue === expectedValue) {
+    return currentValue;
+  }
+
+  await locator.click().catch(() => undefined);
+  await page.keyboard.press("Meta+A").catch(() => undefined);
+  await page.keyboard.press("Backspace").catch(() => undefined);
+  await locator.pressSequentially(expectedValue, { delay: 25 }).catch(() => undefined);
+  currentValue = await readLocatorValue(locator);
+  if (currentValue === expectedValue) {
+    return currentValue;
+  }
+
+  await locator
+    .evaluate((element, value) => {
+      if (
+        element instanceof HTMLInputElement ||
+        element instanceof HTMLTextAreaElement ||
+        element instanceof HTMLSelectElement
+      ) {
+        element.value = value;
+        element.setAttribute("value", value);
+        element.dispatchEvent(new Event("input", { bubbles: true }));
+        element.dispatchEvent(new Event("change", { bubbles: true }));
+        element.dispatchEvent(new Event("blur", { bubbles: true }));
+      }
+    }, expectedValue)
+    .catch(() => undefined);
+
+  return readLocatorValue(locator);
 }
 
 async function triggerSunatItemAmountUpdate(page: Page): Promise<void> {
@@ -6168,7 +7671,7 @@ async function waitForSunatItemAmountPreview(
     }
 
     await triggerSunatItemAmountUpdate(page);
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(SUNAT_TIMING.itemAmountPreviewPollMs);
   }
 }
 
@@ -6213,10 +7716,60 @@ export function calculateSunatUnitPrice(
   return roundSunatAmount(grossUnitPrice / 1.18);
 }
 
-async function ensureCustomerDocumentType(locator: Locator, documentNumber: string): Promise<void> {
+async function ensureCustomerDocumentType(
+  page: Page,
+  locator: Locator,
+  documentNumber: string,
+  onStep?: StepReporter,
+): Promise<void> {
   const targetOptionLabel = inferSunatDocumentTypeLabel(documentNumber);
 
   if (!targetOptionLabel) {
+    return;
+  }
+
+  const normalizedTarget = targetOptionLabel
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  if (normalizedTarget.includes("identidad")) {
+    await onStep?.(`SUNAT: forzaré el tipo de documento «${targetOptionLabel}» en el combo Dojo.`);
+    await selectSunatInicioTipoDocumentoByLabel(page, targetOptionLabel, onStep);
+    const stateAfterSelection = await readSunatInicioTipoDocumentoState(page);
+    await onStep?.(
+      `SUNAT: tras fijar el tipo de documento, quedó visible «${stateAfterSelection.visibleLabel || "(vacío)"}» y hidden tipoDocumento="${stateAfterSelection.hiddenCode || "(vacío)"}".`,
+    );
+    if (stateAfterSelection.hiddenCode && stateAfterSelection.hiddenCode !== "1") {
+      await onStep?.(
+        `SUNAT: el hidden tipoDocumento no quedó en código DNI (valor actual ${stateAfterSelection.hiddenCode}); lo corregiré a "1".`,
+      );
+      for (const scope of collectPageScopes(page)) {
+        const updated = await scope
+          .locator("body")
+          .evaluate(() => {
+            const hiddenInput = document.querySelector('input[type="hidden"][name="tipoDocumento"]');
+            if (!(hiddenInput instanceof HTMLInputElement)) {
+              return false;
+            }
+            hiddenInput.value = "1";
+            hiddenInput.setAttribute("value", "1");
+            hiddenInput.dispatchEvent(new Event("input", { bubbles: true }));
+            hiddenInput.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          })
+          .catch(() => false);
+        if (updated) {
+          break;
+        }
+      }
+      const stateAfterCorrection = await readSunatInicioTipoDocumentoState(page);
+      await onStep?.(
+        `SUNAT: tras corregir, visible «${stateAfterCorrection.visibleLabel || "(vacío)"}» y hidden tipoDocumento="${stateAfterCorrection.hiddenCode || "(vacío)"}".`,
+      );
+    }
     return;
   }
 
@@ -6238,7 +7791,7 @@ async function ensureCustomerDocumentType(locator: Locator, documentNumber: stri
       .trim()
       .toLowerCase();
 
-    return normalizedValue.includes(normalizedTarget) || normalizedValue.includes("identidad");
+    return normalizedValue.includes(normalizedTarget);
   }, targetOptionLabel);
 
   if (matchesExistingValue) {
@@ -6287,7 +7840,7 @@ async function ensureCustomerDocumentType(locator: Locator, documentNumber: stri
 function inferSunatDocumentTypeLabel(documentNumber: string): string | undefined {
   const sanitizedNumber = documentNumber.replace(/\D+/g, "");
 
-  if (sanitizedNumber.length === 8) {
+  if (sanitizedNumber.length >= 7 && sanitizedNumber.length <= 10) {
     return "documento nacional de identidad";
   }
 
@@ -6326,7 +7879,11 @@ async function stopTraceSafely(
   context: BrowserContext,
   tracePath: string,
   artifacts: Artifact[],
+  enabled: boolean,
 ): Promise<void> {
+  if (!enabled) {
+    return;
+  }
   try {
     await context.tracing.stop({ path: tracePath });
     if (fs.existsSync(tracePath)) {

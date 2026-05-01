@@ -1,7 +1,7 @@
 {
   "name": "automate-sunat-desktop",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "commonjs",
   "main": "dist/src/main.js",
   "scripts": {

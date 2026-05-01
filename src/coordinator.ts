@@ -63,6 +63,10 @@ type StepTwoReadiness = {
   message: string;
 };
 
+type SellerSourceFactory = (config: AppConfig, accountId?: string) => SellerSource;
+type InvoiceEmitterFactory = (config: AppConfig, accountId?: string) => InvoiceEmitter;
+type ClosableInvoiceEmitter = InvoiceEmitter & { close?: () => Promise<void> };
+
 export class AutomationCoordinator {
   readonly events = new EventEmitter();
   private interval?: NodeJS.Timeout;
@@ -85,8 +89,8 @@ export class AutomationCoordinator {
   constructor(
     private readonly config: AppConfig,
     private readonly store: RunStore,
-    private readonly sellerSource: SellerSource,
-    private readonly invoiceEmitter: InvoiceEmitter,
+    private readonly sellerSourceOrFactory: SellerSource | SellerSourceFactory,
+    private readonly invoiceEmitterOrFactory: InvoiceEmitter | InvoiceEmitterFactory,
     private readonly resolveAccountConfig: (accountId?: string) => AppConfig,
   ) {
     this.refreshNextCheckAt();
@@ -160,24 +164,24 @@ export class AutomationCoordinator {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
 
-    const reusableSales = this.store.getPendingSalesForRegistration();
+    const reusableSales = this.store.getLatestSalesForStepTwo(options?.accountId);
 
     if (!reusableSales.length) {
       return {
         started: false,
-        message: "No hay ventas guardadas del paso 1 listas para continuar con el paso 2.",
+        message: "No hay ventas del último paso 1 listas para continuar con el paso 2.",
       };
     }
 
     this.launchRun("step2", reusableSales, true, undefined, options?.accountId);
     return {
       started: true,
-      message: `Paso 2 iniciado con ${reusableSales.length} venta(s) guardada(s) del paso 1.`,
+      message: `Paso 2 iniciado con ${reusableSales.length} venta(s) del último paso 1.`,
     };
   }
 
-  async retryAttempt(attemptId: string): Promise<{ started: boolean; message: string }> {
-    const attempt = this.store.getAttempt(attemptId);
+  async retryAttempt(attemptId: string, accountId?: string): Promise<{ started: boolean; message: string }> {
+    const attempt = this.store.getAttempt(attemptId, accountId);
 
     if (!attempt) {
       return { started: false, message: "No se encontr? el intento." };
@@ -187,7 +191,7 @@ export class AutomationCoordinator {
       return { started: false, message: "Los intentos ya enviados no se pueden reintentar." };
     }
 
-    const sale = this.store.getSaleForAttempt(attemptId);
+    const sale = this.store.getSaleForAttempt(attemptId, accountId);
 
     if (!sale) {
       return { started: false, message: "La venta vinculada a este intento ya no est? disponible." };
@@ -197,7 +201,7 @@ export class AutomationCoordinator {
       return { started: false, message: "Ya hay una ejecución en progreso." };
     }
 
-    this.launchRun("retry", [sale], false, this.falabellaFetchOptionsFromConfig(), this.runtime.currentAccountId);
+    this.launchRun("retry", [sale], false, this.falabellaFetchOptionsFromConfig(), accountId);
     return { started: true, message: "Reintento iniciado." };
   }
 
@@ -246,9 +250,9 @@ export class AutomationCoordinator {
     return result;
   }
 
-  getSnapshot(): DashboardSnapshot {
-    const dashboardData = this.store.getDashboardData();
-    const stepTwoReady = this.getStepTwoReadiness();
+  getSnapshot(accountId?: string): DashboardSnapshot {
+    const dashboardData = this.store.getDashboardData(25, accountId);
+    const stepTwoReady = this.getStepTwoReadiness(accountId);
 
     return {
       config: {
@@ -318,13 +322,20 @@ export class AutomationCoordinator {
           ? "Reutilizando ventas guardadas para el paso 2"
           : "Iniciando automatizaci?n";
     this.runtime.currentSaleId = undefined;
-    this.runtime.currentRunId = this.store.createRun(reason);
+    this.runtime.currentRunId = this.store.createRun(reason, accountId);
     this.initializeRunProgress(this.runtime.currentRunId);
     this.publish();
 
     try {
       this.runtime.lastCheckAt = new Date().toISOString();
       const runConfig = this.resolveAccountConfig(accountId);
+      this.appendRunLog({
+        level: "info",
+        stageId: "detectar_ventas",
+        stepId: "abrir_falabella",
+        message: `Cuenta seleccionada para este workflow: ${runConfig.sellerCredentials.username} / RUC ${runConfig.sunatCredentials.ruc}.`,
+      });
+      const sellerSource = this.resolveSellerSource(runConfig, accountId);
       let observedSales: Sale[] = [];
       let salesForSunat: Sale[] = [];
 
@@ -344,7 +355,7 @@ export class AutomationCoordinator {
         this.advanceWorkflow("detectar_ventas", "abrir_falabella", "Automatizaci?n iniciada.");
         if (reason === "retry" && retrySales?.length === 1) {
           const targetSale = retrySales[0];
-          const refreshedSale = await this.sellerSource.refreshSale(
+          const refreshedSale = await sellerSource.refreshSale(
             targetSale.externalId,
             this.stepReporter(targetSale.externalId),
             fetchSalesOptions,
@@ -352,7 +363,7 @@ export class AutomationCoordinator {
           observedSales = refreshedSale ? [refreshedSale] : retrySales;
         } else {
           observedSales =
-            retrySales ?? (await this.sellerSource.fetchSales(this.stepReporter(), fetchSalesOptions));
+            retrySales ?? (await sellerSource.fetchSales(this.stepReporter(), fetchSalesOptions));
         }
         this.currentRunProgress().summary.observedSales = observedSales.length;
         this.advanceWorkflow(
@@ -371,9 +382,10 @@ export class AutomationCoordinator {
         );
         this.completeStage("detectar_ventas", observedSales.length, output.path);
 
-        this.store.registerObservedSales(observedSales);
+        this.store.registerObservedSales(observedSales, accountId);
         salesForSunat = this.store.getSalesForRegistration(
           observedSales.map((sale) => sale.externalId),
+          accountId,
         );
         this.currentRunProgress().summary.queuedSales = salesForSunat.length;
 
@@ -390,8 +402,8 @@ export class AutomationCoordinator {
         }
       }
 
-      if ((stepTwoOnly || this.config.autoContinueStepTwo) && salesForSunat.length > 0) {
-        await this.processSunatRegistrations(salesForSunat, runConfig);
+      if ((stepTwoOnly || runConfig.autoContinueStepTwo) && salesForSunat.length > 0) {
+        await this.processSunatRegistrations(salesForSunat, runConfig, accountId);
       } else if (salesForSunat.length > 0) {
         this.appendRunLog({
           level: "info",
@@ -403,7 +415,7 @@ export class AutomationCoordinator {
 
       this.runtime.currentStep = stepTwoOnly
         ? `Paso 2 completado con ${salesForSunat.length} venta(s) guardada(s) del paso 1`
-        : this.config.autoContinueStepTwo && salesForSunat.length > 0
+        : runConfig.autoContinueStepTwo && salesForSunat.length > 0
           ? `Workflow completado con ${salesForSunat.length} venta(s) procesada(s) automáticamente`
         : salesForSunat.length > 0
           ? `Paso 1 completado con ${salesForSunat.length} venta(s); el paso 2 queda listo para continuar`
@@ -456,11 +468,16 @@ export class AutomationCoordinator {
     }
   }
 
-  private async processSunatRegistrations(sales: Sale[], runConfig: AppConfig): Promise<void> {
+  private async processSunatRegistrations(
+    sales: Sale[],
+    runConfig: AppConfig,
+    accountId?: string,
+  ): Promise<void> {
     const runId = this.runtime.currentRunId;
     if (!runId) {
       return;
     }
+    const invoiceEmitter = this.resolveInvoiceEmitter(runConfig, accountId);
 
     let submitted = 0;
     let failed = 0;
@@ -532,25 +549,60 @@ export class AutomationCoordinator {
         continue;
       }
 
-      this.store.appendAttemptArtifacts(attemptId, submission.preSubmitArtifacts);
-      this.completeWorkflowStep(
-        "registrar_facturas_sunat",
-        "cargar_factura_en_sunat",
-        `Borrador cargado en SUNAT para ${sale.externalId}.`,
-        sale.externalId,
-      );
       this.advanceWorkflow(
         "registrar_facturas_sunat",
-        "esperar_revision",
-        `Validación automática completada para ${sale.externalId}; continúo sin intervención manual.`,
-        sale.externalId,
+        "abrir_sunat",
+        "Iniciando paso 2: registro en SUNAT.",
       );
-      this.completeWorkflowStep(
-        "registrar_facturas_sunat",
-        "esperar_revision",
-        `Validación automática lista para ${sale.externalId}.`,
-        sale.externalId,
-      );
+      this.ensureRunOutputJson(runId, sales);
+      const boletasDownloadDir = this.ensureBoletasDownloadDir();
+
+      for (const sale of sales) {
+        const draft = saleToInvoiceDraft(sale);
+        const attemptId = this.store.createAttempt(sale.externalId, draft, runId, accountId);
+        this.store.setSaleStatus(sale.externalId, "drafted", attemptId, accountId);
+
+        let submission: PreparedSubmission | undefined;
+
+        try {
+          submission = await invoiceEmitter.prepareSubmission(
+            attemptId,
+            draft,
+            this.stepReporter(sale.externalId),
+            {
+              runId,
+              boletasDownloadDir,
+            },
+          );
+        } catch (error) {
+          if (error instanceof OperatorCancelledError) {
+            cancelled += 1;
+          } else {
+            failed += 1;
+          }
+          const message =
+            error instanceof AutomationError
+              ? error.message
+              : error instanceof Error
+                ? error.message
+                : "Error al preparar el envío en SUNAT.";
+          const artifacts = error instanceof AutomationError ? error.artifacts : [];
+          this.store.markAttemptFailed(attemptId, message, artifacts);
+          this.store.setSaleStatus(sale.externalId, "failed", attemptId, accountId);
+          this.appendRunLog({
+            level: "error",
+            stageId: "registrar_facturas_sunat",
+            stepId: "cargar_factura_en_sunat",
+            message,
+            saleExternalId: sale.externalId,
+          });
+          this.syncRegistrationSummary(submitted, failed, cancelled);
+          this.publish();
+          if (error instanceof OperatorCancelledError) {
+            throw error;
+          }
+          continue;
+        }
 
       try {
         appendTimingMark(timingsFile, timingContext, "submit_start");
@@ -566,48 +618,77 @@ export class AutomationCoordinator {
           result.receiptNumber,
           result.receiptPrefix,
         );
-        this.store.setSaleStatus(sale.externalId, "submitted", attemptId);
-        this.enrichRunOutputWithReceiptMetadata(
+        this.advanceWorkflow(
+          "registrar_facturas_sunat",
+          "esperar_revision",
+          `Validación automática completada para ${sale.externalId}; continúo sin intervención manual.`,
           sale.externalId,
-          result.receiptNumber,
-          result.receiptPrefix,
         );
         this.completeWorkflowStep(
           "registrar_facturas_sunat",
-          "enviar_factura",
-          result.receiptNumber
-            ? `Boleta registrada para ${sale.externalId} (${result.receiptNumber}).`
-            : `Boleta registrada para ${sale.externalId}.`,
+          "esperar_revision",
+          `Validación automática lista para ${sale.externalId}.`,
           sale.externalId,
         );
-      } catch (error) {
-        if (error instanceof OperatorCancelledError) {
-          cancelled += 1;
-        } else {
-          failed += 1;
-        }
-        const message =
-          error instanceof AutomationError
-            ? error.message
-            : error instanceof Error
+
+        try {
+          const result = await this.submitPreparedSubmissionAutomatically(
+            submission,
+            this.stepReporter(sale.externalId),
+          );
+          submitted += 1;
+          this.store.markAttemptSubmitted(
+            attemptId,
+            result.artifacts,
+            result.receiptNumber,
+            result.receiptPrefix,
+          );
+          this.store.setSaleStatus(sale.externalId, "submitted", attemptId, accountId);
+          this.enrichRunOutputWithReceiptMetadata(
+            sale.externalId,
+            result.receiptNumber,
+            result.receiptPrefix,
+          );
+          this.completeWorkflowStep(
+            "registrar_facturas_sunat",
+            "enviar_factura",
+            result.receiptNumber
+              ? `Boleta registrada para ${sale.externalId} (${result.receiptNumber}).`
+              : `Boleta registrada para ${sale.externalId}.`,
+            sale.externalId,
+          );
+        } catch (error) {
+          if (error instanceof OperatorCancelledError) {
+            cancelled += 1;
+          } else {
+            failed += 1;
+          }
+          const message =
+            error instanceof AutomationError
               ? error.message
-              : "Error al enviar el comprobante a SUNAT.";
-        const artifacts = error instanceof AutomationError ? error.artifacts : [];
-        this.store.markAttemptFailed(attemptId, message, artifacts);
-        this.store.setSaleStatus(sale.externalId, "failed", attemptId);
-        this.appendRunLog({
-          level: "error",
-          stageId: "registrar_facturas_sunat",
-          stepId: "enviar_factura",
-          message,
-          saleExternalId: sale.externalId,
-        });
+              : error instanceof Error
+                ? error.message
+                : "Error al enviar el comprobante a SUNAT.";
+          const artifacts = error instanceof AutomationError ? error.artifacts : [];
+          this.store.markAttemptFailed(attemptId, message, artifacts);
+          this.store.setSaleStatus(sale.externalId, "failed", attemptId, accountId);
+          this.appendRunLog({
+            level: "error",
+            stageId: "registrar_facturas_sunat",
+            stepId: "enviar_factura",
+            message,
+            saleExternalId: sale.externalId,
+          });
+          this.syncRegistrationSummary(submitted, failed, cancelled);
+          this.publish();
+          if (error instanceof OperatorCancelledError) {
+            throw error;
+          }
+          continue;
+        }
+
         this.syncRegistrationSummary(submitted, failed, cancelled);
         this.publish();
-        if (error instanceof OperatorCancelledError) {
-          throw error;
-        }
-        continue;
       }
 
       this.syncRegistrationSummary(submitted, failed, cancelled);
@@ -617,15 +698,18 @@ export class AutomationCoordinator {
 
     this.syncRegistrationSummary(submitted, failed, cancelled);
 
-    if (submitted === 0 && failed > 0 && cancelled === 0) {
-      this.failWorkflowStep(
-        "registrar_facturas_sunat",
-        "cargar_factura_en_sunat",
-        "No se pudo completar el registro en SUNAT para ninguna venta.",
-      );
-    } else {
-      const boletasDownloadDir = submitted > 0 ? this.currentRunProgress().boletasDownloadDir : undefined;
-      this.completeStage("registrar_facturas_sunat", submitted, boletasDownloadDir);
+      if (submitted === 0 && failed > 0 && cancelled === 0) {
+        this.failWorkflowStep(
+          "registrar_facturas_sunat",
+          "cargar_factura_en_sunat",
+          "No se pudo completar el registro en SUNAT para ninguna venta.",
+        );
+      } else {
+        const boletasDownloadDir = submitted > 0 ? this.currentRunProgress().boletasDownloadDir : undefined;
+        this.completeStage("registrar_facturas_sunat", submitted, boletasDownloadDir);
+      }
+    } finally {
+      await invoiceEmitter.close?.().catch(() => undefined);
     }
   }
 
@@ -707,21 +791,21 @@ export class AutomationCoordinator {
     this.events.emit("state");
   }
 
-  private getStepTwoReadiness(): StepTwoReadiness {
-    const pendingSales = this.store.getPendingSalesForRegistration().length;
+  private getStepTwoReadiness(accountId?: string): StepTwoReadiness {
+    const pendingSales = this.store.getLatestSalesForStepTwo(accountId).length;
 
     if (!pendingSales) {
       return {
         available: false,
         pendingSales: 0,
-        message: "No hay ventas guardadas del paso 1 listas para continuar con el paso 2.",
+        message: "No hay ventas del último paso 1 listas para continuar con el paso 2.",
       };
     }
 
     return {
       available: true,
       pendingSales,
-      message: `${pendingSales} venta(s) guardada(s) del paso 1 listas para continuar con el paso 2.`,
+      message: `${pendingSales} venta(s) del último paso 1 listas para continuar con el paso 2.`,
     };
   }
 
@@ -766,6 +850,7 @@ export class AutomationCoordinator {
 
     return {
       ...progress.summary,
+      accountId: this.runtime.currentAccountId,
       workflowStages: progress.workflowStages,
       logs: progress.logs,
       outputJsonPath: progress.outputJsonPath,
@@ -1030,6 +1115,22 @@ export class AutomationCoordinator {
     }
 
     return null;
+  }
+
+  private resolveSellerSource(config: AppConfig, accountId?: string): SellerSource {
+    if (typeof this.sellerSourceOrFactory === "function") {
+      return this.sellerSourceOrFactory(config, accountId);
+    }
+
+    return this.sellerSourceOrFactory;
+  }
+
+  private resolveInvoiceEmitter(config: AppConfig, accountId?: string): ClosableInvoiceEmitter {
+    if (typeof this.invoiceEmitterOrFactory === "function") {
+      return this.invoiceEmitterOrFactory(config, accountId) as ClosableInvoiceEmitter;
+    }
+
+    return this.invoiceEmitterOrFactory as ClosableInvoiceEmitter;
   }
 
   private writePendingSalesOutput(runId: string, sales: Sale[]): { path: string; content: string } {

@@ -19,6 +19,7 @@ import {
 
 type SaleRow = {
   external_id: string;
+  account_id: string | null;
   status: SaleStatus;
   fingerprint: string;
   sale_json: string;
@@ -28,6 +29,7 @@ type SaleRow = {
 
 type AttemptRow = {
   id: string;
+  account_id: string | null;
   sale_external_id: string;
   run_id: string | null;
   status: InvoiceAttemptRecord["status"];
@@ -47,6 +49,7 @@ type AttemptWithSaleRow = AttemptRow & {
 
 type RunRow = {
   id: string;
+  account_id: string | null;
   reason: string;
   status: RunRecordSummary["status"];
   summary_json: string;
@@ -80,6 +83,15 @@ export class RunStore {
 
   close(): void {
     this.db.close();
+  }
+
+  private scopedSaleId(accountId: string | undefined, externalId: string): string {
+    return accountId ? `${accountId}::${externalId}` : externalId;
+  }
+
+  private unscopedSaleId(scopedExternalId: string): string {
+    const separator = scopedExternalId.indexOf("::");
+    return separator >= 0 ? scopedExternalId.slice(separator + 2) : scopedExternalId;
   }
 
   listAccounts(): AutomationAccountSummary[] {
@@ -266,12 +278,12 @@ export class RunStore {
     };
   }
 
-  registerObservedSales(sales: Sale[]): Sale[] {
+  registerObservedSales(sales: Sale[], accountId?: string): Sale[] {
     const now = new Date().toISOString();
-    const selectSale = this.db.prepare("SELECT * FROM sales WHERE external_id = ?");
+    const selectSale = this.db.prepare("SELECT * FROM sales WHERE external_id = ? AND account_id IS ?");
     const insertSale = this.db.prepare(`
-      INSERT INTO sales (external_id, status, fingerprint, sale_json, attempt_id, first_seen_at, last_seen_at, updated_at)
-      VALUES (@external_id, @status, @fingerprint, @sale_json, @attempt_id, @first_seen_at, @last_seen_at, @updated_at)
+      INSERT INTO sales (external_id, account_id, status, fingerprint, sale_json, attempt_id, first_seen_at, last_seen_at, updated_at)
+      VALUES (@external_id, @account_id, @status, @fingerprint, @sale_json, @attempt_id, @first_seen_at, @last_seen_at, @updated_at)
     `);
     const updateSale = this.db.prepare(`
       UPDATE sales
@@ -286,11 +298,13 @@ export class RunStore {
       const created: Sale[] = [];
 
       for (const sale of incomingSales) {
-        const existing = selectSale.get(sale.externalId) as SaleRow | undefined;
+        const scopedExternalId = this.scopedSaleId(accountId, sale.externalId);
+        const existing = selectSale.get(scopedExternalId, accountId ?? null) as SaleRow | undefined;
 
         if (!existing) {
           insertSale.run({
-            external_id: sale.externalId,
+            external_id: scopedExternalId,
+            account_id: accountId ?? null,
             status: "new",
             fingerprint: sale.fingerprint,
             sale_json: JSON.stringify(sale),
@@ -304,7 +318,7 @@ export class RunStore {
         }
 
         updateSale.run({
-          external_id: sale.externalId,
+          external_id: scopedExternalId,
           fingerprint: sale.fingerprint,
           sale_json: JSON.stringify(sale),
           last_seen_at: now,
@@ -318,7 +332,7 @@ export class RunStore {
     return transaction(sales);
   }
 
-  setSaleStatus(externalId: string, status: SaleStatus, attemptId?: string): void {
+  setSaleStatus(externalId: string, status: SaleStatus, attemptId?: string, accountId?: string): void {
     const updatedAt = new Date().toISOString();
     this.db
       .prepare(
@@ -328,30 +342,33 @@ export class RunStore {
             attempt_id = @attempt_id,
             updated_at = @updated_at
         WHERE external_id = @external_id
+          AND account_id IS @account_id
       `,
       )
       .run({
-        external_id: externalId,
+        external_id: this.scopedSaleId(accountId, externalId),
+        account_id: accountId ?? null,
         status,
         attempt_id: attemptId ?? null,
         updated_at: updatedAt,
       });
   }
 
-  createAttempt(saleExternalId: string, draft: InvoiceDraft, runId?: string): string {
+  createAttempt(saleExternalId: string, draft: InvoiceDraft, runId?: string, accountId?: string): string {
     const id = randomUUID();
     const now = new Date().toISOString();
 
     this.db
       .prepare(
         `
-        INSERT INTO invoice_attempts (id, sale_external_id, run_id, status, draft_json, artifacts_json, error, receipt_number, receipt_prefix, created_at, updated_at, submitted_at)
-        VALUES (@id, @sale_external_id, @run_id, @status, @draft_json, @artifacts_json, @error, @receipt_number, @receipt_prefix, @created_at, @updated_at, @submitted_at)
+        INSERT INTO invoice_attempts (id, account_id, sale_external_id, run_id, status, draft_json, artifacts_json, error, receipt_number, receipt_prefix, created_at, updated_at, submitted_at)
+        VALUES (@id, @account_id, @sale_external_id, @run_id, @status, @draft_json, @artifacts_json, @error, @receipt_number, @receipt_prefix, @created_at, @updated_at, @submitted_at)
       `,
       )
       .run({
         id,
-        sale_external_id: saleExternalId,
+        account_id: accountId ?? null,
+        sale_external_id: this.scopedSaleId(accountId, saleExternalId),
         run_id: runId ?? null,
         status: "drafted",
         draft_json: JSON.stringify(draft),
@@ -455,31 +472,33 @@ export class RunStore {
       });
   }
 
-  getAttempt(attemptId: string): InvoiceAttemptRecord | undefined {
+  getAttempt(attemptId: string, accountId?: string): InvoiceAttemptRecord | undefined {
     const row = this.db
-      .prepare("SELECT * FROM invoice_attempts WHERE id = ?")
-      .get(attemptId) as AttemptRow | undefined;
+      .prepare("SELECT * FROM invoice_attempts WHERE id = ? AND account_id IS ?")
+      .get(attemptId, accountId ?? null) as AttemptRow | undefined;
 
     return row ? this.deserializeAttempt(row) : undefined;
   }
 
-  getSaleForAttempt(attemptId: string): Sale | undefined {
+  getSaleForAttempt(attemptId: string, accountId?: string): Sale | undefined {
     const row = this.db
       .prepare(
         `
         SELECT sales.sale_json
         FROM invoice_attempts
         JOIN sales ON sales.external_id = invoice_attempts.sale_external_id
+          AND sales.account_id IS invoice_attempts.account_id
         WHERE invoice_attempts.id = ?
+          AND invoice_attempts.account_id IS ?
       `,
       )
-      .get(attemptId) as { sale_json: string } | undefined;
+      .get(attemptId, accountId ?? null) as { sale_json: string } | undefined;
 
     return row ? this.deserializeSale(row.sale_json) : undefined;
   }
 
-  getSalesForRegistration(externalIds: string[]): Sale[] {
-    const uniqueExternalIds = [...new Set(externalIds)].filter(Boolean);
+  getSalesForRegistration(externalIds: string[], accountId?: string): Sale[] {
+    const uniqueExternalIds = [...new Set(externalIds)].filter(Boolean).map((id) => this.scopedSaleId(accountId, id));
 
     if (!uniqueExternalIds.length) {
       return [];
@@ -492,43 +511,79 @@ export class RunStore {
         SELECT sale_json
         FROM sales
         WHERE external_id IN (${placeholders})
+          AND account_id IS ?
           AND status IN ('new', 'drafted', 'failed')
         ORDER BY updated_at ASC
       `,
       )
-      .all(...uniqueExternalIds) as Array<{ sale_json: string }>;
+      .all(...uniqueExternalIds, accountId ?? null) as Array<{ sale_json: string }>;
 
     return rows.map((row) => this.deserializeSale(row.sale_json));
   }
 
-  getPendingSalesForRegistration(): Sale[] {
+  getPendingSalesForRegistration(accountId?: string): Sale[] {
     const rows = this.db
       .prepare(
         `
         SELECT sale_json
         FROM sales
-        WHERE status IN ('new', 'drafted', 'failed')
+        WHERE account_id IS ?
+          AND status IN ('new', 'drafted', 'failed')
         ORDER BY updated_at ASC
       `,
       )
-      .all() as Array<{ sale_json: string }>;
+      .all(accountId ?? null) as Array<{ sale_json: string }>;
 
     return rows.map((row) => this.deserializeSale(row.sale_json));
   }
 
-  createRun(reason: string): string {
+  getLatestSalesForStepTwo(accountId?: string): Sale[] {
+    const rows = this.db
+      .prepare(
+        `
+        SELECT reason, summary_json
+        FROM runs
+        WHERE account_id IS ?
+          AND reason != 'step2'
+        ORDER BY started_at DESC
+        LIMIT 25
+      `,
+      )
+      .all(accountId ?? null) as Array<{ reason: string; summary_json: string }>;
+
+    for (const row of rows) {
+      let summary: Record<string, unknown>;
+      try {
+        summary = JSON.parse(row.summary_json || "{}") as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      const outputSaleIds = this.parseRunOutputSaleIds(summary.outputJsonContent);
+      if (!outputSaleIds.length) {
+        continue;
+      }
+
+      return this.getSalesForRegistration(outputSaleIds, accountId);
+    }
+
+    return [];
+  }
+
+  createRun(reason: string, accountId?: string): string {
     const id = randomUUID();
     const now = new Date().toISOString();
 
     this.db
       .prepare(
         `
-        INSERT INTO runs (id, reason, status, summary_json, started_at, ended_at)
-        VALUES (@id, @reason, @status, @summary_json, @started_at, @ended_at)
+        INSERT INTO runs (id, account_id, reason, status, summary_json, started_at, ended_at)
+        VALUES (@id, @account_id, @reason, @status, @summary_json, @started_at, @ended_at)
       `,
       )
       .run({
         id,
+        account_id: accountId ?? null,
         reason,
         status: "running",
         summary_json: JSON.stringify({}),
@@ -684,7 +739,7 @@ export class RunStore {
       });
   }
 
-  getDashboardData(limit = 25): {
+  getDashboardData(limit = 25, accountId?: string): {
     accounts: AutomationAccountSummary[];
     sales: SaleRecordSummary[];
     attempts: InvoiceAttemptRecord[];
@@ -696,16 +751,17 @@ export class RunStore {
         `
         SELECT external_id, status, fingerprint, sale_json, attempt_id, updated_at
         FROM sales
+        WHERE account_id IS ?
         ORDER BY updated_at DESC
         LIMIT ?
       `,
       )
-      .all(limit)
+      .all(accountId ?? null, limit)
       .map((row) => {
         const typedRow = row as SaleRow;
         const sale = this.deserializeSale(typedRow.sale_json);
         return {
-          externalId: typedRow.external_id,
+          externalId: sale.externalId || this.unscopedSaleId(typedRow.external_id),
           status: typedRow.status,
           issuedAt: sale.issuedAt,
           customerName: sale.customer.name,
@@ -727,11 +783,12 @@ export class RunStore {
         `
         SELECT *
         FROM invoice_attempts
+        WHERE account_id IS ?
         ORDER BY updated_at DESC
         LIMIT ?
       `,
       )
-      .all(limit)
+      .all(accountId ?? null, limit)
       .map((row) => this.deserializeAttempt(row as AttemptRow));
 
     const entriesByRunId = new Map<string, DashboardRunEntry[]>();
@@ -741,11 +798,13 @@ export class RunStore {
         SELECT invoice_attempts.*, sales.sale_json
         FROM invoice_attempts
         LEFT JOIN sales ON sales.external_id = invoice_attempts.sale_external_id
+          AND sales.account_id IS invoice_attempts.account_id
+        WHERE invoice_attempts.account_id IS ?
         ORDER BY invoice_attempts.updated_at DESC
         LIMIT ?
       `,
       )
-      .all(limit) as AttemptWithSaleRow[];
+      .all(accountId ?? null, limit) as AttemptWithSaleRow[];
 
     for (const row of attemptRows) {
       if (!row.run_id) {
@@ -762,11 +821,12 @@ export class RunStore {
         `
         SELECT *
         FROM runs
+        WHERE account_id IS ?
         ORDER BY started_at DESC
         LIMIT ?
       `,
       )
-      .all(limit)
+      .all(accountId ?? null, limit)
       .map((row) => {
         const typedRow = row as RunRow;
         const summary = JSON.parse(typedRow.summary_json) as Record<string, unknown>;
@@ -797,6 +857,7 @@ export class RunStore {
         SELECT invoice_attempts.*, sales.sale_json
         FROM invoice_attempts
         LEFT JOIN sales ON sales.external_id = invoice_attempts.sale_external_id
+          AND sales.account_id IS invoice_attempts.account_id
         WHERE invoice_attempts.run_id = ?
         ORDER BY invoice_attempts.updated_at ASC
       `,
@@ -842,7 +903,7 @@ export class RunStore {
   private deserializeAttempt(row: AttemptRow): InvoiceAttemptRecord {
     return {
       id: row.id,
-      saleExternalId: row.sale_external_id,
+      saleExternalId: this.unscopedSaleId(row.sale_external_id),
       status: row.status,
       draft: JSON.parse(row.draft_json) as InvoiceDraft,
       artifacts: JSON.parse(row.artifacts_json) as Artifact[],
@@ -944,6 +1005,7 @@ export class RunStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sales (
         external_id TEXT PRIMARY KEY,
+        account_id TEXT,
         status TEXT NOT NULL,
         fingerprint TEXT NOT NULL,
         sale_json TEXT NOT NULL,
@@ -955,6 +1017,7 @@ export class RunStore {
 
       CREATE TABLE IF NOT EXISTS invoice_attempts (
         id TEXT PRIMARY KEY,
+        account_id TEXT,
         sale_external_id TEXT NOT NULL,
         run_id TEXT,
         status TEXT NOT NULL,
@@ -970,6 +1033,7 @@ export class RunStore {
 
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY,
+        account_id TEXT,
         reason TEXT NOT NULL,
         status TEXT NOT NULL,
         summary_json TEXT NOT NULL DEFAULT '{}',
@@ -990,9 +1054,15 @@ export class RunStore {
       );
     `);
 
+    this.ensureColumn("sales", "account_id", "TEXT");
+    this.ensureColumn("invoice_attempts", "account_id", "TEXT");
     this.ensureColumn("invoice_attempts", "run_id", "TEXT");
     this.ensureColumn("invoice_attempts", "receipt_prefix", "TEXT");
+    this.ensureColumn("runs", "account_id", "TEXT");
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_invoice_attempts_run_id ON invoice_attempts (run_id);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sales_account_id ON sales (account_id);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_invoice_attempts_account_id ON invoice_attempts (account_id);`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_account_id ON runs (account_id);`);
     this.backfillAttemptRunIds();
     this.finalizeInterruptedRuns();
   }

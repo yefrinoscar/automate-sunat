@@ -12,6 +12,15 @@ export function buildDashboardApiUrl(baseUrl: string, endpoint: string): string 
   return normalizedBase ? `${normalizedBase}${endpoint}` : endpoint;
 }
 
+function withAccountId(endpoint: string, accountId?: string | null): string {
+  if (!accountId) {
+    return endpoint;
+  }
+
+  const glue = endpoint.includes("?") ? "&" : "?";
+  return `${endpoint}${glue}accountId=${encodeURIComponent(accountId)}`;
+}
+
 export function getDashboardApiBaseCandidates(
   preferredBaseUrl = import.meta.env.VITE_API_BASE_URL as string | undefined,
 ): string[] {
@@ -35,7 +44,10 @@ export function getDashboardApiBaseCandidates(
   }, []);
 }
 
-export async function fetchDashboardSnapshot(apiBases: string[]): Promise<{
+export async function fetchDashboardSnapshot(
+  apiBases: string[],
+  accountId?: string | null,
+): Promise<{
   snapshot: DashboardSnapshot;
   baseIndex: number;
 }> {
@@ -43,7 +55,7 @@ export async function fetchDashboardSnapshot(apiBases: string[]): Promise<{
 
   for (let index = 0; index < apiBases.length; index += 1) {
     try {
-      const response = await fetch(buildDashboardApiUrl(apiBases[index] ?? "", "/api/state"));
+      const response = await fetch(buildDashboardApiUrl(apiBases[index] ?? "", withAccountId("/api/state", accountId)));
 
       if (!response.ok) {
         lastError = new Error("No se pudo cargar el estado inicial.");
@@ -64,7 +76,7 @@ export async function fetchDashboardSnapshot(apiBases: string[]): Promise<{
     : new Error("No se pudo cargar el dashboard.");
 }
 
-export function useDashboardState() {
+export function useDashboardState(accountId?: string | null) {
   const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [streamState, setStreamState] = useState<StreamState>("loading");
   const [error, setError] = useState<string | null>(null);
@@ -105,7 +117,7 @@ export function useDashboardState() {
       }
 
       closeStream();
-      eventSource = new EventSource(buildDashboardApiUrl(getActiveBase(), "/api/events"));
+      eventSource = new EventSource(buildDashboardApiUrl(getActiveBase(), withAccountId("/api/events", accountId)));
       eventSource.onmessage = (event) => {
         try {
           applySnapshot(JSON.parse(event.data) as DashboardSnapshot);
@@ -130,7 +142,7 @@ export function useDashboardState() {
 
     const bootstrap = async () => {
       try {
-        const result = await fetchDashboardSnapshot(apiBases);
+        const result = await fetchDashboardSnapshot(apiBases, accountId);
         activeBaseIndex = result.baseIndex;
         applySnapshot(result.snapshot);
       } catch (fetchError) {
@@ -152,7 +164,7 @@ export function useDashboardState() {
         window.clearTimeout(reconnectTimer);
       }
     };
-  }, [applySnapshot, refreshTick]);
+  }, [accountId, applySnapshot, refreshTick]);
 
   return {
     snapshot,

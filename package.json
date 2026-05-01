@@ -1,6 +1,6 @@
 {
   "name": "automate-sunat",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Seller-to-SUNAT browser automation with a live dashboard.",
   "main": "dist/index.js",
   "scripts": {
@@ -12,6 +12,7 @@
     "desktop:start": "concurrently -k -n server,electron -c blue,green \"npm start\" \"wait-on http://127.0.0.1:3030/api/state && npx electron desktop/dist/src/main.js\"",
     "desktop:package": "npm run build:web && npm --prefix desktop run package",
     "start": "npm run build:web && tsx src/index.ts",
+    "build": "tsc && npm run build:web",
     "build:web": "npm --prefix frontend run build",
     "test": "npm run test:server && npm run test:web",
     "test:server": "vitest run tests",
@@ -21,6 +22,8 @@
     "typecheck:server": "tsc --noEmit",
     "typecheck:web": "npm --prefix frontend run typecheck",
     "pw:install": "playwright install chromium",
+    "clean:artifacts": "node tools/clean-runtime-data.mjs",
+    "reset:runtime": "node tools/reset-runtime-state.mjs",
     "reset:data": "rm -f data/automation.db data/automation.db-shm data/automation.db-wal && rm -rf data/screenshots data/traces data/auth"
   },
   "keywords": [],
