@@ -10,7 +10,7 @@ import {
 } from "../src/browser";
 import { loadConfig } from "../src/config";
 import { AutomationCoordinator } from "../src/coordinator";
-import { Artifact, InvoiceDraft, normalizeSale, Sale } from "../src/domain";
+import { Artifact, InvoiceDraft, normalizeSale, Sale, saleToInvoiceDraft } from "../src/domain";
 import { RunStore } from "../src/store";
 import { createTempDataDir, waitUntil } from "./helpers";
 
@@ -137,6 +137,20 @@ class FakeEmitter implements InvoiceEmitter {
     _onStep: StepReporter,
     _context?: SubmissionContext,
   ): Promise<PreparedSubmission> {
+    return new FakePreparedSubmission([{ kind: "screenshot", path: "/tmp/fake-review.png" }]);
+  }
+}
+
+class RecordingEmitter implements InvoiceEmitter {
+  readonly preparedSaleIds: string[] = [];
+
+  async prepareSubmission(
+    _attemptId: string,
+    draft: InvoiceDraft,
+    _onStep: StepReporter,
+    _context?: SubmissionContext,
+  ): Promise<PreparedSubmission> {
+    this.preparedSaleIds.push(draft.saleExternalId);
     return new FakePreparedSubmission([{ kind: "screenshot", path: "/tmp/fake-review.png" }]);
   }
 }
@@ -357,7 +371,6 @@ describe("AutomationCoordinator", () => {
       totals: { subtotal: 350, tax: 0, total: 350 },
       raw: {},
     });
-    store.registerObservedSales([saleOne]);
 
     const config = loadConfig({
       APP_PORT: "3030",
@@ -368,10 +381,11 @@ describe("AutomationCoordinator", () => {
       SLOW_MO_MS: "0",
       DATA_DIR: dataDir,
     });
+    const seller = new FakeSellerSource([saleOne]);
     const currentCoordinator = (coordinator = new AutomationCoordinator(
       config,
       store,
-      new FakeSellerSource([]),
+      seller,
       new FakeEmitter(),
       (accountId) => {
         if (!accountId) {
@@ -388,6 +402,10 @@ describe("AutomationCoordinator", () => {
         };
       },
     ));
+
+    const paso1Promise = currentCoordinator.triggerManualRun();
+    await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
+    await paso1Promise;
 
     const runPromise = currentCoordinator.triggerStepTwoRun();
 
@@ -432,8 +450,6 @@ describe("AutomationCoordinator", () => {
     });
     const emitter = new InterruptibleEmitter();
 
-    store.registerObservedSales([saleOne, saleTwo]);
-
     const config = loadConfig({
       APP_PORT: "3030",
       APP_BASE_URL: "http://localhost:3030",
@@ -443,13 +459,18 @@ describe("AutomationCoordinator", () => {
       SLOW_MO_MS: "0",
       DATA_DIR: dataDir,
     });
+    const seller = new FakeSellerSource([saleOne, saleTwo]);
     const currentCoordinator = (coordinator = new AutomationCoordinator(
       config,
       store,
-      new FakeSellerSource([]),
+      seller,
       emitter,
       (accountId) => config,
     ));
+
+    const paso1Promise = currentCoordinator.triggerManualRun();
+    await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
+    await paso1Promise;
 
     const runPromise = currentCoordinator.triggerStepTwoRun();
 
@@ -547,9 +568,6 @@ describe("AutomationCoordinator", () => {
       totals: { subtotal: 1500, tax: 0, total: 1500 },
       raw: {},
     });
-
-    store.registerObservedSales([sale]);
-
     const config = loadConfig({
       APP_PORT: "3030",
       APP_BASE_URL: "http://localhost:3030",
@@ -559,13 +577,18 @@ describe("AutomationCoordinator", () => {
       SLOW_MO_MS: "0",
       DATA_DIR: dataDir,
     });
+    const seller = new FakeSellerSource([sale]);
     const currentCoordinator = (coordinator = new AutomationCoordinator(
       config,
       store,
-      new FakeSellerSource([]),
+      seller,
       new FakeEmitter(),
       () => config,
     ));
+
+    const paso1Promise = currentCoordinator.triggerManualRun();
+    await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
+    await paso1Promise;
 
     expect(currentCoordinator.getSnapshot().runtime.stepTwoReady.available).toBe(true);
     expect(currentCoordinator.getSnapshot().runtime.stepTwoReady.pendingSales).toBe(1);
@@ -596,6 +619,81 @@ describe("AutomationCoordinator", () => {
     expect(String(latestRun?.summary.boletasDownloadDir)).toContain("/boletas-descargadas/");
     expect(snapshot.runtime.stepTwoReady.available).toBe(false);
     expect(snapshot.runtime.pendingApprovals).toHaveLength(0);
+  });
+
+  test("paso 2 reutiliza solo el último lote detectado y no arrastra ventas fallidas viejas", async () => {
+    const staleSale = normalizeSale({
+      externalId: "SALE-OLD-FAILED",
+      issuedAt: "2026-03-20T10:00:00-05:00",
+      currency: "PEN",
+      customer: {
+        name: "Cliente viejo",
+        documentNumber: "20000000001",
+      },
+      items: [{ description: "Producto viejo", quantity: 1, unitPrice: 50, total: 50 }],
+      totals: { subtotal: 50, tax: 0, total: 50 },
+      raw: {},
+    });
+    const latestSaleA = normalizeSale({
+      externalId: "SALE-LATEST-1",
+      issuedAt: "2026-03-24T13:00:00-05:00",
+      currency: "PEN",
+      customer: {
+        name: "Cliente nuevo uno",
+        documentNumber: "20101010105",
+      },
+      items: [{ description: "Mouse", quantity: 1, unitPrice: 90, total: 90 }],
+      totals: { subtotal: 90, tax: 0, total: 90 },
+      raw: {},
+    });
+    const latestSaleB = normalizeSale({
+      externalId: "SALE-LATEST-2",
+      issuedAt: "2026-03-24T13:10:00-05:00",
+      currency: "PEN",
+      customer: {
+        name: "Cliente nuevo dos",
+        documentNumber: "20101010106",
+      },
+      items: [{ description: "Teclado", quantity: 1, unitPrice: 120, total: 120 }],
+      totals: { subtotal: 120, tax: 0, total: 120 },
+      raw: {},
+    });
+
+    store.registerObservedSales([staleSale]);
+    const staleAttemptId = store.createAttempt(staleSale.externalId, saleToInvoiceDraft(staleSale));
+    store.setSaleStatus(staleSale.externalId, "failed", staleAttemptId);
+
+    const config = loadConfig({
+      APP_PORT: "3030",
+      APP_BASE_URL: "http://localhost:3030",
+      SITE_PROFILE_PATH: "./config/custom-profile.json",
+      RUN_MODE: "manual",
+      HEADFUL: "false",
+      SLOW_MO_MS: "0",
+      DATA_DIR: dataDir,
+    });
+    const seller = new FakeSellerSource([latestSaleA, latestSaleB]);
+    const emitter = new RecordingEmitter();
+    const currentCoordinator = (coordinator = new AutomationCoordinator(
+      config,
+      store,
+      seller,
+      emitter,
+      () => config,
+    ));
+
+    const paso1Promise = currentCoordinator.triggerManualRun();
+    await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
+    await paso1Promise;
+
+    expect(currentCoordinator.getSnapshot().runtime.stepTwoReady.pendingSales).toBe(2);
+
+    const paso2Promise = currentCoordinator.triggerStepTwoRun();
+    await waitUntil(() => currentCoordinator.getSnapshot().runtime.isRunning === false);
+    await paso2Promise;
+
+    expect(emitter.preparedSaleIds).toEqual(["SALE-LATEST-1", "SALE-LATEST-2"]);
+    expect(emitter.preparedSaleIds).not.toContain("SALE-OLD-FAILED");
   });
 
   test("returns immediately when a manual run starts", async () => {

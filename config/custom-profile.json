@@ -66,6 +66,8 @@
     "successSelector": "#numeroComprobante",
     "receiptNumberSelector": "#numeroComprobante",
     "pdfDownloadSelector": "#dijit_form_Button_2_label",
+    "xmlDownloadSelector": "xpath=//input[contains(@value,'Descargar XML')] | xpath=//button[contains(normalize-space(.),'Descargar XML')]",
+    "closeSuccessSelector": "xpath=//input[contains(@value,'Cerrar')] | xpath=//button[contains(normalize-space(.),'Cerrar')]",
     "validationErrorSelector": ".form-error"
   }
 }

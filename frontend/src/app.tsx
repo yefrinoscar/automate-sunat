@@ -32,6 +32,18 @@ async function requestAction(
     body?: Record<string, unknown>;
   },
 ) {
+  const payload = await requestActionJson<{ message?: string }>(url, options);
+  return payload.message || "Accion completada.";
+}
+
+async function requestActionJson<T extends Record<string, unknown>>(
+  url: string,
+  options?: {
+    method?: "POST" | "DELETE";
+    preferredBaseUrl?: string;
+    body?: Record<string, unknown>;
+  },
+) : Promise<T> {
   const method = options?.method ?? "POST";
   let lastError: unknown;
 
@@ -49,13 +61,13 @@ async function requestAction(
 
       const response = await fetch(buildDashboardApiUrl(baseUrl, url), init);
 
-      const payload = (await response.json()) as { message?: string };
+      const payload = (await response.json()) as T & { message?: string };
 
       if (!response.ok) {
         throw new Error(payload.message || "La accion fallo.");
       }
 
-      return payload.message || "Accion completada.";
+      return payload;
     } catch (error) {
       lastError = error;
     }
@@ -358,13 +370,6 @@ export function DashboardWorkspace({
 }
 
 export function App() {
-  const { snapshot, streamState, error, refresh } = useDashboardState();
-  const selection = useDashboardSelection(snapshot);
-  const [flashMessage, setFlashMessage] = useState<string | null>(null);
-  const [pendingAction, setPendingAction] = useState<"run-all" | "step-2" | "stop" | null>(null);
-  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
-  const [falabellaDocumentsSearchFrom, setFalabellaDocumentsSearchFrom] = useState("");
-  const [falabellaDocumentsSearchTo, setFalabellaDocumentsSearchTo] = useState("");
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(() => {
     try {
       return window.localStorage.getItem("automation.accountId");
@@ -372,6 +377,13 @@ export function App() {
       return null;
     }
   });
+  const { snapshot, streamState, error, refresh } = useDashboardState(selectedAccountId);
+  const selection = useDashboardSelection(snapshot);
+  const [flashMessage, setFlashMessage] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<"run-all" | "step-2" | "stop" | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [falabellaDocumentsSearchFrom, setFalabellaDocumentsSearchFrom] = useState("");
+  const [falabellaDocumentsSearchTo, setFalabellaDocumentsSearchTo] = useState("");
   const preferredBaseUrl = snapshot?.config.baseUrl;
 
   const accounts = snapshot?.accounts ?? [];
@@ -467,7 +479,16 @@ export function App() {
         refresh();
       },
       async onRetry(attemptId: string) {
-        setFlashMessage(await requestAction(`/api/attempts/${attemptId}/retry`, { preferredBaseUrl }));
+        if (!effectiveAccountId) {
+          setFlashMessage("Primero crea una cuenta para ejecutar la automatización.");
+          return;
+        }
+        setFlashMessage(
+          await requestAction(`/api/attempts/${attemptId}/retry`, {
+            preferredBaseUrl,
+            body: { accountId: effectiveAccountId },
+          }),
+        );
         refresh();
       },
       async onDeleteRun(runId: string) {
@@ -528,7 +549,22 @@ export function App() {
       }}
       onCreateAccount={async (input) => {
         try {
-          await requestAction("/api/accounts", { preferredBaseUrl, body: input });
+          const payload = await requestActionJson<{
+            ok: boolean;
+            account?: {
+              id: string;
+            };
+            message?: string;
+          }>("/api/accounts", { preferredBaseUrl, body: input });
+          if (payload.account?.id) {
+            setSelectedAccountId(payload.account.id);
+            try {
+              window.localStorage.setItem("automation.accountId", payload.account.id);
+            } catch {
+              // ignore
+            }
+          }
+          setFlashMessage(payload.message || "Cuenta creada.");
           refresh();
         } catch (err) {
           const message = err instanceof Error ? err.message : "No se pudo crear la cuenta.";

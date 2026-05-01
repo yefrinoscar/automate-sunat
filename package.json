@@ -22,6 +22,8 @@
     "typecheck:server": "tsc --noEmit",
     "typecheck:web": "npm --prefix frontend run typecheck",
     "pw:install": "playwright install chromium",
+    "clean:artifacts": "node tools/clean-runtime-data.mjs",
+    "reset:runtime": "node tools/reset-runtime-state.mjs",
     "reset:data": "rm -f data/automation.db data/automation.db-shm data/automation.db-wal && rm -rf data/screenshots data/traces data/auth"
   },
   "keywords": [],

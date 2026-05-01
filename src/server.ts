@@ -12,6 +12,20 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
   const staticRoot = path.resolve(process.cwd(), "frontend/dist");
   const hasBuiltDashboard = fs.existsSync(path.join(staticRoot, "index.html"));
 
+  const parseAccountId = (raw: unknown): string | undefined =>
+    typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+
+  const validateAccountId = (accountId: string | undefined) => {
+    if (!accountId) {
+      return "Primero elige una cuenta antes de iniciar el workflow.";
+    }
+    const exists = coordinator.listAccounts().some((account) => account.id === accountId);
+    if (!exists) {
+      return "La cuenta seleccionada ya no existe. Elige otra antes de continuar.";
+    }
+    return null;
+  };
+
   // This emitter fans out state updates to any number of dashboard clients.
   coordinator.events.setMaxListeners(0);
 
@@ -38,8 +52,9 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
     app.use(express.static(staticRoot));
   }
 
-  app.get("/api/state", (_req, res) => {
-    res.json(coordinator.getSnapshot());
+  app.get("/api/state", (req, res) => {
+    const accountId = parseAccountId(req.query?.accountId);
+    res.json(coordinator.getSnapshot(accountId));
   });
 
   app.get("/api/accounts", (_req, res) => {
@@ -104,8 +119,12 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
       return;
     }
 
-    const accountId =
-      typeof req.body?.accountId === "string" && req.body.accountId.trim() ? req.body.accountId.trim() : undefined;
+    const accountId = parseAccountId(req.body?.accountId);
+    const accountError = validateAccountId(accountId);
+    if (accountError) {
+      res.status(400).json({ started: false, message: accountError });
+      return;
+    }
 
     const result = await coordinator.triggerManualRun({
       accountId,
@@ -121,8 +140,12 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
   });
 
   app.post("/api/run/step-2", async (req, res) => {
-    const accountId =
-      typeof req.body?.accountId === "string" && req.body.accountId.trim() ? req.body.accountId.trim() : undefined;
+    const accountId = parseAccountId(req.body?.accountId);
+    const accountError = validateAccountId(accountId);
+    if (accountError) {
+      res.status(400).json({ started: false, message: accountError });
+      return;
+    }
 
     const result = await coordinator.triggerStepTwoRun({ accountId });
     res.status(result.started ? 202 : 409).json(result);
@@ -144,7 +167,14 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
   });
 
   app.post("/api/attempts/:attemptId/retry", async (req, res) => {
-    const result = await coordinator.retryAttempt(req.params.attemptId);
+    const accountId = parseAccountId(req.body?.accountId);
+    const accountError = validateAccountId(accountId);
+    if (accountError) {
+      res.status(400).json({ started: false, message: accountError });
+      return;
+    }
+
+    const result = await coordinator.retryAttempt(req.params.attemptId, accountId);
     res.status(result.started ? 202 : 409).json(result);
   });
 
@@ -159,8 +189,10 @@ export function createServer(coordinator: AutomationCoordinator): express.Expres
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
+    const accountId = parseAccountId(req.query?.accountId);
+
     const sendSnapshot = () => {
-      res.write(`data: ${JSON.stringify(coordinator.getSnapshot())}\n\n`);
+      res.write(`data: ${JSON.stringify(coordinator.getSnapshot(accountId))}\n\n`);
     };
 
     sendSnapshot();

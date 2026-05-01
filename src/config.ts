@@ -5,6 +5,14 @@ import { z } from "zod";
 
 dotenv.config();
 
+function resolveRuntimeDotenvPath(): string {
+  return path.resolve(process.cwd(), ".env");
+}
+
+export function reloadRuntimeDotenv(envPath = resolveRuntimeDotenvPath()): void {
+  dotenv.config({ path: envPath, override: true });
+}
+
 const booleanish = z
   .string()
   .optional()
@@ -29,7 +37,9 @@ const envSchema = z.object({
   AUTO_CONTINUE_STEP_2: booleanish.default(false),
   CHECK_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
   HEADFUL: booleanish.default(true),
-  SLOW_MO_MS: z.coerce.number().int().min(0).default(250),
+  SLOW_MO_MS: z.coerce.number().int().min(0).default(0),
+  DEBUG_ARTIFACTS: booleanish.default(false),
+  SUNAT_SESSION_MAX_INVOICES: z.coerce.number().int().positive().default(6),
   SELLER_USERNAME: z.string().default(""),
   SELLER_PASSWORD: z.string().default(""),
   SUNAT_USERNAME: z.string().default(""),
@@ -96,6 +106,8 @@ export interface AppConfig {
   checkIntervalMinutes: number;
   headful: boolean;
   slowMoMs: number;
+  debugArtifacts: boolean;
+  sunatSessionMaxInvoices: number;
   sellerCredentials: {
     username: string;
     password: string;
@@ -153,6 +165,8 @@ export function loadConfig(overrides: Partial<NodeJS.ProcessEnv> = {}): AppConfi
     checkIntervalMinutes: parsed.CHECK_INTERVAL_MINUTES,
     headful: parsed.HEADFUL,
     slowMoMs: parsed.SLOW_MO_MS,
+    debugArtifacts: parsed.DEBUG_ARTIFACTS,
+    sunatSessionMaxInvoices: parsed.SUNAT_SESSION_MAX_INVOICES,
     sellerCredentials: {
       username: parsed.SELLER_USERNAME,
       password: parsed.SELLER_PASSWORD,
@@ -188,4 +202,32 @@ export function ensureDirectories(config: AppConfig): void {
       fs.mkdirSync(directory, { recursive: true });
     }
   }
+}
+
+function persistEnvKey(key: string, value: string, envPath = resolveRuntimeDotenvPath()): void {
+  const existing = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf8") : "";
+  const lines = existing ? existing.split(/\r?\n/) : [];
+  const assignment = `${key}=${value}`;
+  let replaced = false;
+
+  const nextLines = lines.map((line) => {
+    if (line.startsWith(`${key}=`)) {
+      replaced = true;
+      return assignment;
+    }
+    return line;
+  });
+
+  if (!replaced) {
+    nextLines.push(assignment);
+  }
+
+  const normalized = nextLines.join("\n").replace(/\n+$/g, "");
+  fs.writeFileSync(envPath, `${normalized}\n`, "utf8");
+  reloadRuntimeDotenv(envPath);
+}
+
+export function persistFalabellaDocumentsSearchFrom(value: string): void {
+  const normalized = normalizeFalabellaDocumentsSearchFromIso(value);
+  persistEnvKey("FALABELLA_DOCUMENTS_SEARCH_FROM", normalized ?? "");
 }
