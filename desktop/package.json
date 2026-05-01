@@ -8,15 +8,7 @@
     "dev": "cross-env NODE_ENV=development ELECTRON_IS_DEV=1 electron dist/src/main.js",
     "generate-icons": "node tools/generate-icons.cjs",
     "build": "tsc -p tsconfig.json",
-    "package": "npm --prefix .. run build && node tools/prepare-app-bundle.cjs && npm run generate-icons && npm run build && electron-builder"
-  },
-  "dependencies": {
-    "adm-zip": "^0.5.16",
-    "better-sqlite3": "^12.8.0",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
-    "playwright": "^1.58.2",
-    "zod": "^4.3.6"
+    "package": "npm run generate-icons && npm run build && node tools/package.cjs"
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",

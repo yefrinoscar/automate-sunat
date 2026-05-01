@@ -7,18 +7,8 @@
   "files": [
     "dist/**"
   ],
-  "extraResources": [
-    {
-      "from": "release/app-bundle",
-      "to": "app-bundle",
-      "filter": ["**/*"]
-    },
-    {
-      "from": "release/pw-browsers",
-      "to": "pw-browsers",
-      "filter": ["**/*"]
-    }
-  ],
+  "afterPack": "tools/clean-macos-xattrs.cjs",
+  "extraResources": [],
   "asar": true,
   "linux": {
     "icon": "assets/icons",

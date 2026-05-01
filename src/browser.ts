@@ -636,9 +636,8 @@ export class FalabellaSellerSource implements SellerSource {
 export class SunatPortalEmitter implements InvoiceEmitter {
   private sunatSession?: { browser: Browser; context: BrowserContext };
   private sunatSessionPromise?: Promise<{ browser: Browser; context: BrowserContext }>;
-  private sunatSessionInvoiceCount = 0;
-  private sunatSessionIsHeadful = false;
-  private reusableSunatPage?: Page;
+  private invoicePage?: Page;
+  private tracingActive = false;
 
   constructor(
     private readonly config: AppConfig,
@@ -654,10 +653,8 @@ export class SunatPortalEmitter implements InvoiceEmitter {
   ): Promise<PreparedSubmission> {
     await onStep(`Abriendo el portal SUNAT para ${draft.saleExternalId}`);
 
-    let forceHeadfulSunat = SUNAT_REQUIRES_HEADFUL;
-    let { browser, context: browserContext } = await this.getOrCreateSunatSession(forceHeadfulSunat);
-    let page = this.takeReusableSunatPage(browserContext) ?? (await browserContext.newPage());
-    let validationWatcher = startSunatValidationIframeSearchLogger(page, onStep, { initiallyPaused: true });
+    const { browser, context: browserContext } = await this.getOrCreateSunatSession();
+    const { page, freshlyOpened } = await this.getOrOpenInvoicePage(browserContext, onStep);
     const tracePath = path.join(this.config.dataPaths.tracesDir, `${attemptId}.zip`);
     const preSubmitScreenshot = path.join(
       this.config.dataPaths.screenshotsDir,
@@ -669,70 +666,34 @@ export class SunatPortalEmitter implements InvoiceEmitter {
     );
 
     try {
-      const reopenSunatPageInHeadful = async (reason: string): Promise<void> => {
-        await onStep(`${reason} Reintentaré SUNAT en modo visible para evitar la pantalla en blanco.`);
-        validationWatcher.stop();
-        await page.close().catch(() => undefined);
-        await this.closeSunatSession();
-        forceHeadfulSunat = true;
-        const nextSession = await this.getOrCreateSunatSession(true);
-        browser = nextSession.browser;
-        browserContext = nextSession.context;
-        page = await browserContext.newPage();
-        validationWatcher = startSunatValidationIframeSearchLogger(page, onStep, { initiallyPaused: true });
-      };
-
-      const ensureSunatReachableOrReopen = async (contextLabel: string): Promise<void> => {
-        if (forceHeadfulSunat || this.config.headful) {
-          return;
-        }
-        if (await shouldRetrySunatInHeadful(page)) {
-          await reopenSunatPageInHeadful(`SUNAT no cargó bien al ${contextLabel}.`);
-          await this.loginIfNeeded(page, onStep);
-        }
-      };
-
-      const reusingBoletaPage = await isSunatBoletaWorkflowSurface(page, this.profile);
-      if (reusingBoletaPage) {
-        await onStep("SUNAT: reutilizaré la misma pantalla de boleta para continuar con la siguiente venta.");
-        await dismissSunatContactValidationSurface(page, onStep);
-      } else {
-        try {
-          await this.loginIfNeeded(page, onStep);
-        } catch (error) {
-          if (!forceHeadfulSunat && !this.config.headful && shouldRetrySunatHeadfulAfterError(error)) {
-            await reopenSunatPageInHeadful(
-              `SUNAT falló al abrir en headless (${error instanceof Error ? error.message : String(error)}).`,
-            );
-            await this.loginIfNeeded(page, onStep);
+      if (!this.tracingActive) {
+        await browserContext.tracing.start({ screenshots: true, snapshots: true });
+        this.tracingActive = true;
+      }
+      await browserContext.tracing.startChunk().catch(() => undefined);
+      let needsFreshLogin = freshlyOpened;
+      if (!freshlyOpened) {
+        await onStep(`Reutilizando sesión SUNAT y formulario abierto para ${draft.saleExternalId}.`);
+        const ready = await tryWaitForAnyVisibleLocatorInPageTree(
+          page,
+          customerDocumentSelectors(this.profile.sunat.customerDocumentSelector),
+          1_500,
+        );
+        if (!ready) {
+          if (this.looksLikeSunatLoginPage(page)) {
+            await onStep("La sesión SUNAT expiró; reabriré el navegador para reautenticar.");
+            needsFreshLogin = true;
           } else {
-            throw error;
+            await onStep("Formulario de boleta no estaba listo; vuelvo a navegar el menú SOL.");
+            await this.navigateToBoletaForm(page, onStep, 30_000);
           }
         }
-        await ensureSunatReachableOrReopen("abrir el login");
-        if (this.config.debugArtifacts) {
-          await browserContext.tracing.start({ screenshots: true, snapshots: true });
-        }
-        await dismissSunatNotificationsPrompt(page, onStep);
-        await ensureSunatReachableOrReopen("cerrar avisos iniciales");
+      }
 
-        if (this.profile.sunat.postLoginMenuLabels?.length) {
-          await navigateSunatSolMenu(
-            page,
-            this.profile.sunat.postLoginMenuLabels,
-            this.profile,
-            this.profile.sunat.invoiceUrl,
-            this.config,
-            onStep,
-          );
-          await waitForAnyVisibleLocatorInPageTree(
-            page,
-            customerDocumentSelectors(this.profile.sunat.customerDocumentSelector),
-            90_000,
-          );
-        } else {
-          await page.goto(this.profile.sunat.invoiceUrl, { waitUntil: "domcontentloaded" });
-        }
+      if (needsFreshLogin) {
+        await this.loginIfNeeded(page, onStep);
+        await dismissSunatNotificationsPrompt(page, onStep);
+        await this.navigateToBoletaForm(page, onStep, 90_000);
       }
 
       await onStep(`Llenando la factura SUNAT para ${draft.saleExternalId}`);
@@ -760,7 +721,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       const customerDocumentField = await waitForAnyVisibleLocatorInPageTree(
         page,
         customerDocumentSelectors(this.profile.sunat.customerDocumentSelector),
-        30_000,
+        15_000,
       );
       await onStep(`Campo documento encontrado (${await describeLocatorIdentity(customerDocumentField.locator)}).`);
       const writtenDocument = await fillSunatCustomerDocumentFieldExact(
@@ -771,12 +732,6 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       await customerDocumentField.locator.press("Tab").catch(() => undefined);
       await onStep(`Documento ingresado en SUNAT exactamente como quedó en el campo: ${writtenDocument || "(vacío)"}.`);
       await onStep("Documento ingresado; espero que SUNAT complete el nombre del cliente.");
-      await waitForSunatProcessingToSettle(
-        page,
-        "la consulta del documento del cliente",
-        onStep,
-        SUNAT_TIMING.postDocumentFillProcessingTimeoutMs,
-      );
 
       await onStep(`Validando nombre del cliente en SUNAT para ${draft.saleExternalId}`);
       const customerNameField = await waitForAutofilledCustomerName(
@@ -792,19 +747,13 @@ export class SunatPortalEmitter implements InvoiceEmitter {
       const continueButton = await tryWaitForBottomMostVisibleLocatorInPageTree(
         page,
         customerContinueSelectors(this.profile.sunat.customerContinueSelector ?? "text=Continuar"),
-        10_000,
+        6_000,
         customerNameField.scope,
       );
       if (continueButton) {
         await onStep("Encontré el primer Continuar y voy a hacer click.");
         await continueButton.locator.scrollIntoViewIfNeeded().catch(() => undefined);
         await continueButton.locator.click();
-        await waitForSunatProcessingToSettle(
-          page,
-          "el avance inicial del cliente",
-          onStep,
-          SUNAT_TIMING.postCustomerContinueProcessingTimeoutMs,
-        );
       } else {
         await onStep("No encontré el primer Continuar; seguiré con los campos visibles.");
       }
@@ -897,6 +846,7 @@ export class SunatPortalEmitter implements InvoiceEmitter {
         onStep,
         runId: submissionContext?.runId,
         boletasDownloadDir: submissionContext?.boletasDownloadDir,
+        releasePage: (outcome) => this.releaseInvoicePage(outcome),
       });
     } catch (error) {
       validationWatcher.stop();
@@ -907,14 +857,101 @@ export class SunatPortalEmitter implements InvoiceEmitter {
           artifacts.push({ kind: "screenshot", path: errorScreenshot });
         }
       }
-      await stopTraceSafely(browserContext, tracePath, artifacts, this.config.debugArtifacts);
-      await page.close().catch(() => undefined);
+      await stopTraceChunkSafely(browserContext, tracePath, artifacts);
+      await this.discardInvoicePage();
       throw normalizeAutomationError(error, artifacts);
     }
   }
 
   async close(): Promise<void> {
-    await this.closeSunatSession();
+    await this.discardInvoicePage();
+
+    const session = this.sunatSession ?? (await this.sunatSessionPromise?.catch(() => undefined));
+    this.sunatSession = undefined;
+    this.sunatSessionPromise = undefined;
+
+    if (!session) {
+      return;
+    }
+
+    if (this.tracingActive) {
+      await session.context.tracing.stop().catch(() => undefined);
+      this.tracingActive = false;
+    }
+    await session.context.close().catch(() => undefined);
+    await session.browser.close().catch(() => undefined);
+  }
+
+  private async getOrOpenInvoicePage(
+    browserContext: BrowserContext,
+    onStep: StepReporter,
+  ): Promise<{ page: Page; freshlyOpened: boolean }> {
+    if (this.invoicePage && !this.invoicePage.isClosed()) {
+      return { page: this.invoicePage, freshlyOpened: false };
+    }
+
+    const page = await browserContext.newPage();
+    page.once("close", () => {
+      if (this.invoicePage === page) {
+        this.invoicePage = undefined;
+      }
+    });
+    startSunatValidationIframeSearchLogger(page, onStep);
+    this.invoicePage = page;
+    return { page, freshlyOpened: true };
+  }
+
+  private looksLikeSunatLoginPage(page: Page): boolean {
+    try {
+      const url = page.url();
+      return /api-seguridad\.sunat\.gob\.pe|loginMenuSol|AutenticaMenuInternet/i.test(url);
+    } catch {
+      return false;
+    }
+  }
+
+  private async navigateToBoletaForm(
+    page: Page,
+    onStep: StepReporter,
+    waitForFormMs: number,
+  ): Promise<void> {
+    if (this.profile.sunat.postLoginMenuLabels?.length) {
+      await navigateSunatSolMenu(page, this.profile.sunat.postLoginMenuLabels, onStep);
+      await waitForAnyVisibleLocatorInPageTree(
+        page,
+        customerDocumentSelectors(this.profile.sunat.customerDocumentSelector),
+        waitForFormMs,
+      );
+    } else {
+      await page.goto(this.profile.sunat.invoiceUrl, { waitUntil: "domcontentloaded" });
+    }
+  }
+
+  private async releaseInvoicePage(outcome: "success" | "failed" | "cancelled"): Promise<void> {
+    const page = this.invoicePage;
+    if (!page || page.isClosed()) {
+      this.invoicePage = undefined;
+      return;
+    }
+
+    if (outcome !== "success") {
+      await this.discardInvoicePage();
+      return;
+    }
+
+    try {
+      await page.goto(this.profile.sunat.invoiceUrl, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    } catch {
+      await this.discardInvoicePage();
+    }
+  }
+
+  private async discardInvoicePage(): Promise<void> {
+    const page = this.invoicePage;
+    this.invoicePage = undefined;
+    if (page && !page.isClosed()) {
+      await page.close().catch(() => undefined);
+    }
   }
 
   private async loginIfNeeded(page: Page, onStep: StepReporter): Promise<void> {
@@ -1221,6 +1258,7 @@ class PendingSunatSubmission implements PreparedSubmission {
       onStep: StepReporter;
       runId?: string;
       boletasDownloadDir?: string;
+      releasePage: (outcome: "success" | "failed" | "cancelled") => Promise<void>;
     },
   ) {
     this.interruptionSignal = new Promise<string>((resolve) => {
@@ -1268,14 +1306,26 @@ class PendingSunatSubmission implements PreparedSubmission {
       await onStep("Buscando el botón Emitir de la preliminar.");
       const submitButton = await waitForAnyVisibleLocatorInPageTree(
         this.params.page,
-        finalSubmitSelectors(this.params.profile.sunat.finalSubmitSelector),
-        30_000,
+        this.params.profile.sunat.finalSubmitSelector,
+        15_000,
       );
       await onStep(`Botón Emitir encontrado (${await describeLocatorIdentity(submitButton.locator)}); haré click.`);
       await clickSunatAction(this.params.page, submitButton.locator, onStep, "Emitir");
       await onStep("Click en Emitir realizado; esperando la confirmación.");
       await waitForSunatProcessingToSettle(this.params.page, "la emisión preliminar", onStep, 25_000);
-      await resolveSunatPostEmitTransition(this.params.page, this.params.profile, onStep);
+
+      if (this.params.profile.sunat.confirmAcceptSelector) {
+        await onStep("Esperando el botón Aceptar de la confirmación.");
+        const acceptButton = await waitForVisibleLocatorInPageTree(
+          this.params.page,
+          this.params.profile.sunat.confirmAcceptSelector,
+          1500,
+        );
+        await onStep(`Botón Aceptar encontrado (${await describeLocatorIdentity(acceptButton.locator)}); haré click.`);
+        await acceptButton.locator.click();
+        await onStep("Click en Aceptar realizado; esperando el comprobante emitido.");
+        await waitForSunatProcessingToSettle(this.params.page, "la confirmación de emisión", onStep, 5000);
+      }
 
       await this.params.page.waitForLoadState("domcontentloaded").catch(() => undefined);
 
@@ -1296,7 +1346,7 @@ class PendingSunatSubmission implements PreparedSubmission {
       const successMarker = await waitForVisibleLocatorInPageTree(
         this.params.page,
         this.params.profile.sunat.successSelector,
-        30_000,
+        25_000,
       );
       await onStep(`Pantalla final detectada (${await describeLocatorIdentity(successMarker.locator)}).`);
       if (this.params.config.debugArtifacts) {
@@ -1328,23 +1378,19 @@ class PendingSunatSubmission implements PreparedSubmission {
       );
       artifacts.push(...downloadedFiles.map((path) => ({ kind: "file" as const, path })));
 
-      const closedForReuse = await closeSunatSuccessSurface(
-        this.params.page,
-        this.params.profile,
-        onStep,
-      );
-      if (closedForReuse) {
-        this.keepPageForReuse = true;
+      if (this.params.profile.sunat.closeSuccessSelector) {
+        const closeButton = await tryWaitForVisibleLocatorInPageTree(
+          this.params.page,
+          this.params.profile.sunat.closeSuccessSelector,
+          3_000,
+        );
+        if (closeButton) {
+          await closeButton.locator.click().catch(() => undefined);
+        }
       }
 
-      await stopTraceSafely(
-        this.params.context,
-        this.params.tracePath,
-        artifacts,
-        this.params.config.debugArtifacts,
-      );
-
-      await this.cleanup();
+      await stopTraceChunkSafely(this.params.context, this.params.tracePath, artifacts);
+      await this.cleanup("success");
 
       return {
         artifacts,
@@ -1362,13 +1408,8 @@ class PendingSunatSubmission implements PreparedSubmission {
       if (fs.existsSync(failureScreenshot)) {
         artifacts.push({ kind: "screenshot", path: failureScreenshot });
       }
-      await stopTraceSafely(
-        this.params.context,
-        this.params.tracePath,
-        artifacts,
-        this.params.config.debugArtifacts,
-      );
-      await this.cleanup();
+      await stopTraceChunkSafely(this.params.context, this.params.tracePath, artifacts);
+      await this.cleanup("failed");
       throw normalizeAutomationError(error, artifacts);
     }
   }
@@ -1387,26 +1428,14 @@ class PendingSunatSubmission implements PreparedSubmission {
       artifacts.push({ kind: "screenshot", path: cancellationScreenshot });
     }
 
-    await stopTraceSafely(
-      this.params.context,
-      this.params.tracePath,
-      artifacts,
-      this.params.config.debugArtifacts,
-    );
-    await this.cleanup();
+    await stopTraceChunkSafely(this.params.context, this.params.tracePath, artifacts);
+    await this.cleanup("cancelled");
     return artifacts;
   }
 
-  private async cleanup(): Promise<void> {
+  private async cleanup(outcome: "success" | "failed" | "cancelled"): Promise<void> {
     this.cleanupStarted = true;
-    this.params.validationWatcher.stop();
-    if (this.keepPageForReuse && !this.params.page.isClosed()) {
-      this.params.releasePageForReuse?.(this.params.page);
-      return;
-    }
-    if (!this.params.page.isClosed()) {
-      await this.params.page.close().catch(() => undefined);
-    }
+    await this.params.releasePage(outcome).catch(() => undefined);
   }
 }
 
@@ -4311,8 +4340,12 @@ async function performLoginFlow(params: {
     .waitForLoadState("networkidle", { timeout: SUNAT_TIMING.loginPostSubmitNetworkIdleTimeoutMs })
     .catch(() => undefined);
 
-  if (await isLoggedIn(page, login.loggedInSelector)) {
-    return;
+async function navigateSunatSolMenu(page: Page, labels: string[], onStep: StepReporter): Promise<void> {
+  for (const label of labels) {
+    await onStep(`Menú SUNAT: ${label}`);
+    const target = await waitForVisibleTextTargetInPageTree(page, label, 45_000);
+    await target.scrollIntoViewIfNeeded();
+    await target.click();
   }
 
   const loginStillVisible =
@@ -4981,7 +5014,7 @@ async function installSunatContactValidationModalDismisser(context: BrowserConte
 }
 
 async function dismissSunatNotificationsPrompt(page: Page, onStep?: StepReporter): Promise<void> {
-  const button = await tryFindVisibleTextTargetInPageTree(page, "Ver más tarde", 7_500);
+  const button = await tryFindVisibleTextTargetInPageTree(page, "Ver más tarde", 2_500);
 
   if (!button) {
     return;
@@ -4990,92 +5023,6 @@ async function dismissSunatNotificationsPrompt(page: Page, onStep?: StepReporter
   await onStep?.("SUNAT mostró el aviso del buzón electrónico; haré click en Ver más tarde.");
   await button.scrollIntoViewIfNeeded().catch(() => undefined);
   await button.click().catch(() => undefined);
-  await page.waitForTimeout(SUNAT_TIMING.notificationsDismissPauseMs);
-}
-
-async function dismissSunatContactValidationSurface(
-  page: Page,
-  onStep?: StepReporter,
-): Promise<boolean> {
-  const campaignVisible = await isAnyVisibleLocatorInPageTree(page, [
-    "#divModalCampana",
-    "#ifrVCE",
-    "text=VALIDA TUS DATOS DE CONTACTO",
-    "text=Informativo",
-    "text=Continuar sin confirmar",
-    "text=Finalizar",
-  ]).catch(() => false);
-
-  if (!campaignVisible) {
-    return false;
-  }
-
-  await onStep?.(
-    "SUNAT mostró la validación de datos de contacto; cerraré el flujo con Finalizar y luego Continuar sin confirmar.",
-  );
-
-  const finalizeTarget = await tryWaitForAnyVisibleLocatorInPageTree(
-    page,
-    [
-      "#btnFinalizarValidacionDatos",
-      "xpath=//button[contains(normalize-space(.), 'Finalizar')]",
-      "xpath=//span[contains(normalize-space(.), 'Finalizar')]",
-      "xpath=//input[contains(@value, 'Finalizar')]",
-    ],
-    3_000,
-  );
-  if (finalizeTarget) {
-    await finalizeTarget.locator.scrollIntoViewIfNeeded().catch(() => undefined);
-    await finalizeTarget.locator.click({ force: true, timeout: 5_000 }).catch(() => undefined);
-    await page.waitForTimeout(400).catch(() => undefined);
-  }
-
-  const continueTarget = await tryWaitForAnyVisibleLocatorInPageTree(
-    page,
-    [
-      "#btnCerrar",
-      "xpath=//button[contains(normalize-space(.), 'Continuar sin confirmar')]",
-      "xpath=//span[contains(normalize-space(.), 'Continuar sin confirmar')]",
-      "xpath=//input[contains(@value, 'Continuar sin confirmar')]",
-    ],
-    4_000,
-  );
-  if (continueTarget) {
-    await continueTarget.locator.scrollIntoViewIfNeeded().catch(() => undefined);
-    await continueTarget.locator.click({ force: true, timeout: 5_000 }).catch(() => undefined);
-    await page.waitForTimeout(400).catch(() => undefined);
-  }
-
-  const stillVisible = await isAnyVisibleLocatorInPageTree(page, [
-    "#divModalCampana",
-    "#ifrVCE",
-    "text=VALIDA TUS DATOS DE CONTACTO",
-  ]).catch(() => false);
-
-  if (stillVisible) {
-    await onStep?.(
-      "SUNAT: el modal de contacto siguió visible tras los clicks; desactivaré su overlay para que no bloquee el menú.",
-    );
-    await page
-      .evaluate(() => {
-        const ids = ["divModalCampana", "ifrVCE"];
-        for (const id of ids) {
-          const element = document.getElementById(id);
-          if (!(element instanceof HTMLElement)) {
-            continue;
-          }
-          element.setAttribute("aria-hidden", "true");
-          element.style.setProperty("visibility", "hidden", "important");
-          element.style.setProperty("opacity", "0", "important");
-          element.style.setProperty("pointer-events", "none", "important");
-          element.style.setProperty("display", "none", "important");
-        }
-      })
-      .catch(() => undefined);
-    await page.waitForTimeout(200).catch(() => undefined);
-  }
-
-  return true;
 }
 
 async function waitForVisibleTextTargetInPageTree(
@@ -5300,8 +5247,8 @@ async function waitForAutofilledCustomerName(
   onStep?: StepReporter,
   sunatInconsistentDniRecovery?: { profile: SiteProfile; draft: InvoiceDraft },
 ): Promise<{ scope: PageScope; locator: Locator }> {
-  let field = await waitForAnyVisibleLocatorInPageTree(page, selectors, 30_000, preferredScope);
-  const deadline = Date.now() + 20_000;
+  let field = await waitForAnyVisibleLocatorInPageTree(page, selectors, 8_000, preferredScope);
+  const deadline = Date.now() + 15_000;
   const expected = normalizeComparableText(expectedName);
   const fieldIdentity = await describeLocatorIdentity(field.locator);
   let nextProgressLogAt = Date.now();
@@ -6740,24 +6687,25 @@ async function continueSunatBoletaWizard(
 
   await onStep?.("Buscando el botón Continuar de la boleta.");
   const continueSelectors = customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar");
-  const firstContinue = await tryWaitForBottomMostVisibleLocatorInPageTree(page, continueSelectors, 30_000);
+  const firstContinue = await tryWaitForBottomMostVisibleLocatorInPageTree(page, continueSelectors, 15_000);
   if (!firstContinue) {
     await onStep?.("No encontré Continuar; esperaré si SUNAT cambia de pantalla por su cuenta.");
     await waitForAnyVisibleLocatorInPageTree(
       page,
-      [...preliminarySunatStepMarkers(), ...finalSubmitSelectors(profile.sunat.finalSubmitSelector)].filter(Boolean),
-      30_000,
+      [...preliminarySunatStepMarkers(), profile.sunat.finalSubmitSelector ?? ""].filter(Boolean),
+      20_000,
     );
     return;
   }
   await onStep?.("Encontré Continuar y voy a hacer click.");
-  await clickSunatAction(page, firstContinue.locator, onStep, "Continuar inicial");
-  await waitForSunatProcessingToSettle(page, "el primer Continuar", onStep, 20_000);
+  await firstContinue.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  await firstContinue.locator.click();
+  await waitForSunatProcessingToSettle(page, "el primer Continuar", onStep, 15_000);
 
   const optionalMarker = await tryWaitForAnyVisibleLocatorInPageTree(
     page,
     optionalSunatStepMarkers(),
-    8_000,
+    3_000,
   );
 
   if (!optionalMarker) {
@@ -6766,10 +6714,11 @@ async function continueSunatBoletaWizard(
     return;
   }
 
-  const secondContinue = await waitForBottomMostVisibleLocatorInPageTree(page, continueSelectors, 15_000);
+  const secondContinue = await waitForBottomMostVisibleLocatorInPageTree(page, continueSelectors, 10_000);
   await onStep?.("SUNAT mostró una pantalla opcional; hago click en Continuar otra vez.");
-  await clickSunatAction(page, secondContinue.locator, onStep, "Continuar pantalla opcional");
-  await waitForSunatProcessingToSettle(page, "la pantalla opcional", onStep, 60_000);
+  await secondContinue.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  await secondContinue.locator.click();
+  await waitForSunatProcessingToSettle(page, "la pantalla opcional", onStep, 30_000);
 
   await onStep?.("Verificando si SUNAT ya avanzó desde la pantalla opcional.");
   await waitForAnyVisibleLocatorInPageTree(
@@ -6779,7 +6728,7 @@ async function continueSunatBoletaWizard(
       ...finalSubmitSelectors(profile.sunat.finalSubmitSelector),
       ...additionalSunatTransportStepMarkers(),
     ].filter(Boolean),
-    45_000,
+    25_000,
   );
 
   await resolveAdditionalSunatTransportStep(page, profile, onStep);
@@ -6902,13 +6851,8 @@ async function resolveAdditionalSunatTransportStep(
       transportAcceptButton.locator,
     )}) con los valores actuales.`,
   );
-  await clickSunatAction(page, transportAcceptButton.locator, onStep, "Aceptar pantalla adicional");
-  await waitForSunatProcessingToSettle(
-    page,
-    "la pantalla adicional de traslado",
-    onStep,
-    SUNAT_TIMING.postTransportAcceptProcessingTimeoutMs,
-  );
+  await transportAcceptButton.locator.scrollIntoViewIfNeeded().catch(() => undefined);
+  await transportAcceptButton.locator.click().catch(() => undefined);
 
   const nextMarker = await tryWaitForAnyVisibleLocatorInPageTree(
     page,
@@ -7106,15 +7050,22 @@ async function addItemsViaSunatModal(
       await onStep(`Botón Adicionar encontrado; abriendo el modal del item ${index + 1}.`);
       await clickSunatAction(page, addButton.locator, onStep, `Adicionar item ${index + 1}`);
 
-      const dialog = await waitForAnyVisibleLocatorInPageTree(
-        page,
-        itemDialogSelectors(itemDialogSelector),
-        30_000,
-        addButton.scope,
-      );
-      await onStep(`Modal del item ${index + 1} abierto; completaré los campos.`);
+    const addButton = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      addItemButtonSelectors(profile.sunat.addItemButtonSelector),
+      15_000,
+      preferredScope,
+    );
+    await onStep(`Botón Adicionar encontrado; abriendo el modal del item ${index + 1}.`);
+    await addButton.locator.click();
 
-      await selectSunatItemKindAsGood(page, dialog.scope);
+    const dialog = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemDialogSelectors(itemDialogSelector),
+      10_000,
+      addButton.scope,
+    );
+    await onStep(`Modal del item ${index + 1} abierto; completaré los campos.`);
 
       const quantityField = await waitForAnyVisibleLocatorWithinRoot(
         dialog.locator,
@@ -7124,25 +7075,14 @@ async function addItemsViaSunatModal(
       await quantityField.fill(String(item.quantity));
       await onStep(`Cantidad del item ${index + 1} registrada: ${item.quantity}.`);
 
-      if (profile.sunat.itemUnitMeasureSelector) {
-        const unitMeasureField = await tryWaitForAnyVisibleLocatorInPageTree(
-          page,
-          itemUnitMeasureSelectors(profile.sunat.itemUnitMeasureSelector),
-          5_000,
-          dialog.scope,
-        );
-        if (unitMeasureField) {
-          await setSunatUnitMeasure(unitMeasureField.locator, item.description);
-        }
-      }
-
-      const descriptionField = await waitForAnyVisibleLocatorWithinRoot(
-        dialog.locator,
-        itemDescriptionSelectors(profile.sunat.itemDescriptionSelector),
-        30_000,
-      );
-      await descriptionField.fill(sanitizedDescription);
-      await onStep(`Descripción del item ${index + 1} registrada.`);
+    const quantityField = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemQuantitySelectors(profile.sunat.itemQuantitySelector),
+      8_000,
+      dialog.scope,
+    );
+    await quantityField.locator.fill(String(item.quantity));
+    await onStep(`Cantidad del item ${index + 1} registrada: ${item.quantity}.`);
 
       await selectSunatTaxCategory(page, dialog.scope, profile, draft);
 
@@ -7163,7 +7103,8 @@ async function addItemsViaSunatModal(
       const dialogSelectorList = itemDialogSelectors(itemDialogSelector);
       await clickSunatItemAcceptAction(
         page,
-        preferredScope,
+        itemUnitMeasureSelectors(profile.sunat.itemUnitMeasureSelector),
+        2_500,
         dialog.scope,
         dialogSelectorList,
         profile.sunat.itemRowSelector,
@@ -7201,19 +7142,14 @@ async function addItemsViaSunatModal(
   }
 }
 
-async function waitForSunatAddItemButtonWithRecovery(
-  page: Page,
-  preferredScope: PageScope,
-  profile: SiteProfile,
-  config: AppConfig,
-  onStep: StepReporter | undefined,
-  itemIndex: number,
-): Promise<{ scope: PageScope; locator: Locator }> {
-  const addSelectors = addItemButtonSelectors(profile.sunat.addItemButtonSelector);
-  const immediateAddButton = await tryWaitForAnyVisibleLocatorInPageTree(page, addSelectors, 2_000, preferredScope);
-  if (immediateAddButton) {
-    return immediateAddButton;
-  }
+    const descriptionField = await waitForAnyVisibleLocatorInPageTree(
+      page,
+      itemDescriptionSelectors(profile.sunat.itemDescriptionSelector),
+      8_000,
+      dialog.scope,
+    );
+    await descriptionField.locator.fill(sanitizedDescription);
+    await onStep(`Descripción del item ${index + 1} registrada.`);
 
   const customerSurfaceVisible = await isAnyVisibleLocatorInPageTree(
     page,
@@ -7228,9 +7164,9 @@ async function waitForSunatAddItemButtonWithRecovery(
   if (customerSurfaceVisible) {
     const continueButton = await tryWaitForBottomMostVisibleLocatorInPageTree(
       page,
-      customerContinueSelectors(profile.sunat.customerContinueSelector ?? "text=Continuar"),
-      5_000,
-      preferredScope,
+      itemUnitPriceSelectors(profile.sunat.itemUnitPriceSelector),
+      8_000,
+      dialog.scope,
     );
     if (continueButton) {
       await onStep?.(
@@ -7269,11 +7205,9 @@ async function waitForSunatAddItemButtonWithRecovery(
     );
     await navigateSunatSolMenu(
       page,
-      profile.sunat.postLoginMenuLabels,
-      profile,
-      profile.sunat.invoiceUrl,
-      config,
-      onStep ?? (async () => undefined),
+      itemAcceptSelectors(itemAcceptSelector),
+      8_000,
+      dialog.scope,
     );
     await dismissSunatContactValidationSurface(page, onStep);
   }
@@ -7303,111 +7237,21 @@ async function clickSunatItemAcceptAction(
     await tryDismissGenericSunatDialog(page, onStep);
     await waitForSunatProcessingToSettle(
       page,
-      `${label} (preparar botón)`,
-      onStep,
-      3_000,
-    ).catch(() => undefined);
+      preferredScope,
+      itemDialogSelectors(itemDialogSelector),
+      profile.sunat.itemRowSelector,
+      existingRowCount + index + 1,
+      15_000,
+      dialog.scope,
+    );
+    await onStep(`El modal del item ${index + 1} ya se cerró en SUNAT.`);
 
-    if (await hasSunatItemAcceptanceSucceeded(page, gridScope, dialogSelectors, rowSelector, minimumRowCount, dialogScope)) {
-      await onStep?.(`SUNAT completó ${label} mientras limpiaba overlays; seguiré con el flujo.`);
-      return;
-    }
-
-    const acceptButton = await tryWaitForAnyVisibleLocatorInPageTree(page, selectors, 5_000, dialogScope);
-    if (!acceptButton) {
-      if (await hasSunatItemAcceptanceSucceeded(page, gridScope, dialogSelectors, rowSelector, minimumRowCount, dialogScope)) {
-        await onStep?.(`SUNAT ya reflejó ${label} aunque el botón no quedó visible; continuaré.`);
-        return;
-      }
-      await onStep?.(`SUNAT: no veo el botón de ${label} tras limpiar overlays (intento ${attempt}/3).`);
-      continue;
-    }
-
-    try {
-      await clickSunatAction(page, acceptButton.locator, onStep, label);
-      if (await hasSunatItemAcceptanceSucceeded(page, gridScope, dialogSelectors, rowSelector, minimumRowCount, dialogScope)) {
-        return;
-      }
-      return;
-    } catch (error) {
-      lastError = error;
-      const message = error instanceof Error ? error.message : String(error ?? "");
-      await onStep?.(`SUNAT: ${label} falló en intento ${attempt}/3 (${truncateForLog(message, 180)}).`);
-      await tryDismissGenericSunatDialog(page, onStep);
-      await page.waitForTimeout(350).catch(() => undefined);
-    }
-  }
-
-  await onStep?.(`SUNAT: ${label} no quedó claro tras los reintentos; esperaré unos segundos por si el modal ya está cerrándose solo.`);
-  const acceptedOnGraceWindow = await waitForSunatItemAcceptanceGracefully(
-    page,
-    gridScope,
-    dialogSelectors,
-    rowSelector,
-    minimumRowCount,
-    dialogScope,
-  );
-  if (acceptedOnGraceWindow) {
-    await onStep?.(`SUNAT terminó aplicando ${label} durante la espera adicional; continuaré.`);
-    return;
-  }
-
-  throw lastError instanceof Error ? lastError : new Error(`No pude completar ${label} en el modal del item.`);
-}
-
-async function hasSunatItemAcceptanceSucceeded(
-  page: Page,
-  gridScope: PageScope,
-  dialogSelectors: string[],
-  rowSelector: string | undefined,
-  minimumRowCount: number,
-  dialogScope?: PageScope,
-): Promise<boolean> {
-  if (rowSelector) {
-    const visibleRows = await countVisibleItemRows(gridScope, rowSelector).catch(() => 0);
-    if (visibleRows >= minimumRowCount) {
-      return true;
-    }
-  }
-
-  const dialog = await tryWaitForAnyVisibleLocatorInPageTree(page, dialogSelectors, 400, dialogScope);
-  if (!dialog) {
-    const resumedMainBoleta = await isAnyVisibleLocatorInPageTree(page, [
-      ...addItemButtonSelectors(undefined),
-      ...customerContinueSelectors("#boleta\\.botonGrabarDocumento_label"),
-      "#boleta\\.botonGrabarDocumento_label",
-      "#boleta\\.botonGrabarDocumento",
-      "text=Continuar",
-    ]).catch(() => false);
-
-    if (resumedMainBoleta) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-async function waitForSunatItemAcceptanceGracefully(
-  page: Page,
-  gridScope: PageScope,
-  dialogSelectors: string[],
-  rowSelector: string | undefined,
-  minimumRowCount: number,
-  dialogScope?: PageScope,
-  timeoutMs = 8_000,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    if (
-      await hasSunatItemAcceptanceSucceeded(
-        page,
-        gridScope,
-        dialogSelectors,
-        rowSelector,
-        minimumRowCount,
-        dialogScope,
+    if (profile.sunat.itemRowSelector) {
+      await waitForMinimumItemRows(
+        preferredScope,
+        profile.sunat.itemRowSelector,
+        existingRowCount + index + 1,
+        1_000,
       )
     ) {
       return true;
@@ -8047,6 +7891,21 @@ async function stopTraceSafely(
     }
   } catch {
     return;
+  }
+}
+
+async function stopTraceChunkSafely(
+  context: BrowserContext,
+  tracePath: string,
+  artifacts: Artifact[],
+): Promise<void> {
+  try {
+    await context.tracing.stopChunk({ path: tracePath });
+    if (fs.existsSync(tracePath)) {
+      artifacts.push({ kind: "trace", path: tracePath });
+    }
+  } catch {
+    /* tracing may not be active; ignore */
   }
 }
 

@@ -10,7 +10,7 @@
     "dev:web:wait": "node tools/wait-for-server.mjs && npm --prefix frontend run dev",
     "desktop:dev": "concurrently -k -n app,electron -c blue,green \"npm run dev\" \"wait-on http://127.0.0.1:5173 && npx electron desktop/dist/src/main.js\"",
     "desktop:start": "concurrently -k -n server,electron -c blue,green \"npm start\" \"wait-on http://127.0.0.1:3030/api/state && npx electron desktop/dist/src/main.js\"",
-    "desktop:package": "npm --prefix desktop run package",
+    "desktop:package": "npm run build:web && npm --prefix desktop run package",
     "start": "npm run build:web && tsx src/index.ts",
     "build": "tsc && npm run build:web",
     "build:web": "npm --prefix frontend run build",
